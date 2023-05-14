@@ -4,15 +4,26 @@
 #include <time.h>
 #include <vector>
 #include <chrono>
+#include <string>
+#include <cassert>
 
-#include "matmul-v0.cu"
+#define STAGES 1
 
+extern __global__ void matmul(half *A, half *B, half *C, int M, int N, int K);
+
+// #define DEBUG
+// #define PRINT
+#ifdef DEBUG
+#include <omp.h>
+const int M = 1024;
+const int N = 1024;
+const int K = 1024;
+#else
 const int M = 5376;
 const int N = 5376;
 const int K = 2048;
+#endif
 #define MAX(a, b) (a) > (b) ? (a) : (b)
-// #define DEBUG
-// #define PRINT
 
 /**
  * Panic wrapper for unwinding CUDA runtime errors
@@ -28,8 +39,26 @@ const int K = 2048;
         }                                                                     \
     }
 
-int main()
+int main(int argc, char *argv[])
 {
+
+// if (argc > 1) {
+//     assert((argc - 1) % 2 == 0);
+//     for (int i = 1; i < argc; i+= 2) {
+//         char* key = argv[i];
+//         char* value = argv[i+1];
+//         std::string keys(key);
+//         if (keys == "stages") {
+//             STAGES = std::atoi(value);
+//             std::cout << "Setting to " << STAGES << " stages.\n";
+//         }
+//     }
+// }
+#ifdef DEBUG
+    std::cout << "Debugging using shape M=" << M << ", N=" << N << ", K=" << K << "\n";
+#else
+    std::cout << "Test performance using shape M=" << M << ", N=" << N << ", K=" << K << "\n";
+#endif
     srand(time(NULL));
     half *hA = (half *)malloc(M * K * 2);
     half *hB = (half *)malloc(K * N * 2);
@@ -58,9 +87,12 @@ int main()
     }
 
 #ifdef DEBUG
-    // simple tiling to make it a bit faster
+    std::cout << "Computing golden values...\n";
+// simple tiling to make it a bit faster
+#pragma omp parallel for
     for (int i = 0; i < M; i += 64)
     {
+#pragma omp parallel for
         for (int j = 0; j < N; j += 64)
         {
             float accum[64 * 64] = {0};
@@ -89,6 +121,7 @@ int main()
             }
         }
     }
+    std::cout << "Golden values done!\n";
 #endif
 
     half *dA;
@@ -107,7 +140,7 @@ int main()
     dim3 dimGrid(N / 128, M / 128);
 
 #ifndef DEBUG
-    int smem_size = (128 * 32 * 2 * 2 + 128 * 128 * 4);
+    int smem_size = (STAGES * 128 * 32 * 2 * 2 + 128 * 128 * 2);
     if (smem_size >= (48 << 10))
     {
         CUDA_CHECK(cudaFuncSetAttribute(matmul,
@@ -134,15 +167,18 @@ int main()
 #endif
 
 #ifdef DEBUG
-    int smem_size = (128 * 32 * 2 * 2 + 128 * 128 * 4);
+    int smem_size = (STAGES * 128 * 32 * 2 * 2 + 128 * 128 * 2);
+    std::cout << "Using shared memory = " << (double)smem_size / 1e3 << " KB.\n";
     if (smem_size >= (48 << 10))
     {
         CUDA_CHECK(cudaFuncSetAttribute(matmul,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smem_size));
     }
+    std::cout << "Computing result values...\n";
     matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
     CUDA_CHECK(cudaGetLastError());
+    std::cout << "Computing results done!\n";
     CUDA_CHECK(cudaMemcpy(hC, dC, M * N * 2, cudaMemcpyDeviceToHost));
 
 #ifdef PRINT

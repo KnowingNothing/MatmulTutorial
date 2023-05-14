@@ -1,3 +1,8 @@
+// A100 PCIE 80GB
+// Test performance using shape M=5376, N=5376, K=2048
+// Running cost of CUDA kernel is 3.59273ms
+// TFLOPS: 32.9499
+
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cuda.h>
