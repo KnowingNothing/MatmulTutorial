@@ -2,8 +2,8 @@
 
 // 3090
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 5.71692ms
-// TFLOPS: 20.7069
+// Running cost of CUDA kernel is 2.16845ms
+// TFLOPS: 54.5921
 
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -27,12 +27,23 @@ __device__ void loadSmemA(half *smem, half *A, int M, int K, int ko)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 32; ++i)
+    for (int i = 0; i < 4; ++i)
     {
-        int row = i * 4 + tid / 32;
-        int col = tid % 32;
+        int row = i * 32 + tid / 4;
+        int col = tid % 4 * 8;
         // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
-        smem[row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16] = A[(by * 128 + row) * K + ko * KI + col];
+
+        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
+        uint32_t smem_ptr;
+
+        asm(
+            "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
+            : "=r"(smem_ptr)
+            : "l"(ptr));
+
+        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(smem_ptr),
+                     "l"(&A[(by * 128 + row) * K + (ko * KI + col)]),
+                     "n"(16));
     }
 }
 
@@ -44,12 +55,23 @@ __device__ void loadSmemB(half *smem, half *B, int N, int K, int ko)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 32; ++i)
+    for (int i = 0; i < 4; ++i)
     {
-        int row = i * 4 + tid / 32;
-        int col = tid % 32;
+        int row = i * 32 + tid / 4;
+        int col = tid % 4 * 8;
         // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
-        smem[row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16] = B[(bx * 128 + row) * K + ko * KI + col];
+
+        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
+        uint32_t smem_ptr;
+
+        asm(
+            "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
+            : "=r"(smem_ptr)
+            : "l"(ptr));
+
+        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(smem_ptr),
+                     "l"(&B[(bx * 128 + row) * K + (ko * KI + col)]),
+                     "n"(16));
     }
 }
 
@@ -163,20 +185,25 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     // prologue
     loadSmemA(SA1, A, M, K, 0);
     loadSmemB(SB1, B, N, K, 0);
+    asm volatile("cp.async.commit_group;\n" ::);
 
     loadSmemA(SA2, A, M, K, 1);
     loadSmemB(SB2, B, N, K, 1);
+    asm volatile("cp.async.commit_group;\n" ::);
 
     loadSmemA(SA3, A, M, K, 2);
     loadSmemB(SB3, B, N, K, 2);
+    asm volatile("cp.async.commit_group;\n" ::);
 
-    for (int ko = 0; ko < K / KI; ko += 4)
+    for (int ko = 0; ko < K / KI - 4; ko += 4)
     {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
         if (ko + 3 < K / KI)
         {
             loadSmemA(SA4, A, M, K, ko + 3);
             loadSmemB(SB4, B, N, K, ko + 3);
+            asm volatile("cp.async.commit_group;\n" ::);
         }
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
@@ -193,11 +220,13 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
             }
         }
 
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
         if (ko + 4 < K / KI)
         {
             loadSmemA(SA1, A, M, K, ko + 4);
             loadSmemB(SB1, B, N, K, ko + 4);
+            asm volatile("cp.async.commit_group;\n" ::);
         }
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
@@ -214,11 +243,13 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
             }
         }
 
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
         if (ko + 5 < K / KI)
         {
             loadSmemA(SA2, A, M, K, ko + 5);
             loadSmemB(SB2, B, N, K, ko + 5);
+            asm volatile("cp.async.commit_group;\n" ::);
         }
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
@@ -235,6 +266,102 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
             }
         }
 
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
+        __syncthreads();
+        if (ko + 6 < K / KI)
+        {
+            loadSmemA(SA3, A, M, K, ko + 6);
+            loadSmemB(SB3, B, N, K, ko + 6);
+        }
+        for (int ki = 0; ki < KI / KII; ki += 1)
+        {
+            // 64x64x16 mma for each warp
+            loadFragA(FragA, SA4, ki);
+            loadFragB(FragB, SB4, ki);
+            for (int mii = 0; mii < MII / wmmaM; mii += 1)
+            {
+                for (int nii = 0; nii < NII / wmmaN; nii += 1)
+                {
+                    // 16x16x16 for each wmma
+                    nvcuda::wmma::mma_sync(Accum[mii * (NII / wmmaN) + nii], FragA[mii], FragB[nii], Accum[mii * (NII / wmmaN) + nii]);
+                }
+            }
+        }
+    }
+
+    // the last 4 iterations
+    {
+        int ko = (K / KI / 4 - 1) * 4;
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
+        __syncthreads();
+        if (ko + 3 < K / KI)
+        {
+            loadSmemA(SA4, A, M, K, ko + 3);
+            loadSmemB(SB4, B, N, K, ko + 3);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < KI / KII; ki += 1)
+        {
+            // 64x64x16 mma for each warp
+            loadFragA(FragA, SA1, ki);
+            loadFragB(FragB, SB1, ki);
+            for (int mii = 0; mii < MII / wmmaM; mii += 1)
+            {
+                for (int nii = 0; nii < NII / wmmaN; nii += 1)
+                {
+                    // 16x16x16 for each wmma
+                    nvcuda::wmma::mma_sync(Accum[mii * (NII / wmmaN) + nii], FragA[mii], FragB[nii], Accum[mii * (NII / wmmaN) + nii]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
+        __syncthreads();
+        if (ko + 4 < K / KI)
+        {
+            loadSmemA(SA1, A, M, K, ko + 4);
+            loadSmemB(SB1, B, N, K, ko + 4);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < KI / KII; ki += 1)
+        {
+            // 64x64x16 mma for each warp
+            loadFragA(FragA, SA2, ki);
+            loadFragB(FragB, SB2, ki);
+            for (int mii = 0; mii < MII / wmmaM; mii += 1)
+            {
+                for (int nii = 0; nii < NII / wmmaN; nii += 1)
+                {
+                    // 16x16x16 for each wmma
+                    nvcuda::wmma::mma_sync(Accum[mii * (NII / wmmaN) + nii], FragA[mii], FragB[nii], Accum[mii * (NII / wmmaN) + nii]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(1));
+        __syncthreads();
+        if (ko + 5 < K / KI)
+        {
+            loadSmemA(SA2, A, M, K, ko + 5);
+            loadSmemB(SB2, B, N, K, ko + 5);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int ki = 0; ki < KI / KII; ki += 1)
+        {
+            // 64x64x16 mma for each warp
+            loadFragA(FragA, SA3, ki);
+            loadFragB(FragB, SB3, ki);
+            for (int mii = 0; mii < MII / wmmaM; mii += 1)
+            {
+                for (int nii = 0; nii < NII / wmmaN; nii += 1)
+                {
+                    // 16x16x16 for each wmma
+                    nvcuda::wmma::mma_sync(Accum[mii * (NII / wmmaN) + nii], FragA[mii], FragB[nii], Accum[mii * (NII / wmmaN) + nii]);
+                }
+            }
+        }
+
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(0));
         __syncthreads();
         if (ko + 6 < K / KI)
         {
