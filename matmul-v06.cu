@@ -235,8 +235,10 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     half *SB4 = SB3 + NI * KI;
     float *SC = reinterpret_cast<float *>(shared_storage);
 
-    unsigned int FragA[4];
-    unsigned int FragB[4];
+    unsigned int FragA[2 * 4];
+    unsigned int FragB[2 * 4];
+    unsigned int * FragAs[] = {FragA, FragA + 4};
+    unsigned int * FragBs[] = {FragB, FragB + 4};
     float Accum[8] = {0.0};
 
     // prologue
@@ -256,6 +258,8 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
+        loadFragA(FragAs[0], SA1, 0);
+        loadFragB(FragBs[0], SB1, 0);
         if (ko + 3 < K / KI)
         {
             loadSmemA(SA4, A, M, K, ko + 3);
@@ -266,20 +270,24 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            loadFragA(FragA, SA1, ki);
-            loadFragB(FragB, SB1, ki);
+            if (ki + 1 < KI / KII) {
+                loadFragA(FragAs[(ki + 1) % 2], SA1, ki + 1);
+                loadFragB(FragBs[(ki + 1) % 2], SB1, ki + 1);
+            }
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
                 }
             }
         }
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
+        loadFragA(FragAs[0], SA2, 0);
+        loadFragB(FragBs[0], SB2, 0);
         if (ko + 4 < K / KI)
         {
             loadSmemA(SA1, A, M, K, ko + 4);
@@ -290,20 +298,24 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            loadFragA(FragA, SA2, ki);
-            loadFragB(FragB, SB2, ki);
+            if (ki + 1 < KI / KII) {
+                loadFragA(FragAs[(ki + 1) % 2], SA2, ki + 1);
+                loadFragB(FragBs[(ki + 1) % 2], SB2, ki + 1);
+            }
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
                 }
             }
         }
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
+        loadFragA(FragAs[0], SA3, 0);
+        loadFragB(FragBs[0], SB3, 0);
         if (ko + 5 < K / KI)
         {
             loadSmemA(SA2, A, M, K, ko + 5);
@@ -314,20 +326,24 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            loadFragA(FragA, SA3, ki);
-            loadFragB(FragB, SB3, ki);
+            if (ki < KI / KII) {
+                loadFragA(FragAs[(ki + 1) % 2], SA3, ki + 1);
+                loadFragB(FragBs[(ki + 1) % 2], SB3, ki + 1);
+            }
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
                 }
             }
         }
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
+        loadFragA(FragAs[0], SA4, 0);
+        loadFragB(FragBs[0], SB4, 0);
         if (ko + 6 < K / KI)
         {
             loadSmemA(SA3, A, M, K, ko + 6);
@@ -337,14 +353,16 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            loadFragA(FragA, SA4, ki);
-            loadFragB(FragB, SB4, ki);
+            if (ki + 1 < KI / KII) {
+                loadFragA(FragAs[(ki + 1) % 2], SA4, ki + 1);
+                loadFragB(FragBs[(ki + 1) % 2], SB4, ki + 1);
+            }
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
                 }
             }
         }
