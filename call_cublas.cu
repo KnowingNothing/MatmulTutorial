@@ -127,6 +127,10 @@ int main(int argc, char *argv[])
     cublasHandle_t handle;
     cublasCreate(&handle);
 
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
     half alpha = 1.0;
     half beta = 0.0;
 
@@ -143,22 +147,29 @@ int main(int argc, char *argv[])
     CUDA_CHECK(cudaMemcpy(dC, hC, M * N * 2, cudaMemcpyHostToDevice));
 
     // warmup
-    for (int i = 0; i < 10; ++i)
+    // for (int i = 0; i < 10; ++i)
+    // {
+    //     gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, dA, K, dB, K, &beta, dC, M);
+    // }
+    cudaDeviceSynchronize();
+    // auto start = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(start);
+    for (int i = 0; i < 20; ++i)
     {
         gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, dA, K, dB, K, &beta, dC, M);
     }
-    cudaDeviceSynchronize();
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 200; ++i)
-    {
-        gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, dA, K, dB, K, &beta, dC, M);
-    }
-    cudaDeviceSynchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    std::cout << "Running cost of CuBLAS is " << ms / 20.0 << "ms\n";
+    std::cout << "TFLOPS: " << (float)M * N * K * 2 / (ms / 20.0) * 1e3 / 1e12 << "\n";
+    // cudaDeviceSynchronize();
+    // auto end = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-    std::cout << "Running cost of CuBLAS is " << duration.count() / 1e3 / 200.0 << "ms\n";
-    std::cout << "TFLOPS: " << (float)M * N * K * 2 / ((float)duration.count() / 1e3 / 200.0) * 1e3 / 1e12 << "\n";
+    // std::cout << "Running cost of CuBLAS is " << duration.count() / 1e3 / 200.0 << "ms\n";
+    // std::cout << "TFLOPS: " << (float)M * N * K * 2 / ((float)duration.count() / 1e3 / 200.0) * 1e3 / 1e12 << "\n";
 
     free(hA);
     free(hB);
