@@ -150,23 +150,33 @@ int main(int argc, char *argv[])
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         smem_size));
     }
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
     // warmup
-    for (int i = 0; i < 10; ++i)
+    // for (int i = 0; i < 10; ++i)
+    // {
+    //     matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
+    // }
+    cudaDeviceSynchronize();
+    // auto start = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(start);
+    for (int i = 0; i < 20; ++i)
     {
         matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
     }
-    cudaDeviceSynchronize();
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 200; ++i)
-    {
-        matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
-    }
-    cudaDeviceSynchronize();
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    std::cout << "Running cost of CUDA kernel is " << ms / 20.0 << "ms\n";
+    std::cout << "TFLOPS: " << (float)M * N * K * 2 / (ms / 20.0) * 1e3 / 1e12 << "\n";
+    // cudaDeviceSynchronize();
+    // auto end = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-    std::cout << "Running cost of CUDA kernel is " << duration.count() / 1e3 / 200.0 << "ms\n";
-    std::cout << "TFLOPS: " << (float)M * N * K * 2 / ((float)duration.count() / 1e3 / 200.0) * 1e3 / 1e12 << "\n";
+    // std::cout << "Running cost of CUDA kernel is " << duration.count() / 1e3 / 200.0 << "ms\n";
+    // std::cout << "TFLOPS: " << (float)M * N * K * 2 / ((float)duration.count() / 1e3 / 200.0) * 1e3 / 1e12 << "\n";
 #endif
 
 #ifdef DEBUG
