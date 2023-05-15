@@ -39,7 +39,7 @@ __device__ void loadSmemB(half *smem, half *B, int N, int K, int ko)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < 32; ++i)
     {
         int row = i * 4 + tid / 32;
         int col = tid % 32;
@@ -134,12 +134,14 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     // warp mma: 64x64x16
     extern __shared__ uint8_t shared_storage[];
     half *SA1 = reinterpret_cast<half *>(shared_storage);
-    half *SA2 = reinterpret_cast<half *>(shared_storage + MI * KI * sizeof(half));
-    half *SB1 = reinterpret_cast<half *>(shared_storage + 2 * MI * KI * sizeof(half));
-    half *SB2 = reinterpret_cast<half *>(shared_storage + 2 * MI * KI * sizeof(half) + NI * KI * sizeof(half));
-    half *SAs[] = {SA1, SA2};
-    half *SBs[] = {SB1, SB2};
-    float *SC = reinterpret_cast<float *>(shared_storage + 2 * MI * KI * sizeof(half) + 2 * NI * KI * sizeof(half));
+    half *SA2 = SA1 + MI * KI;
+    half *SA3 = SA2 + MI * KI;
+    half *SA4 = SA3 + MI * KI;
+    half *SB1 = SA4 + MI * KI;
+    half *SB2 = SB1 + NI * KI;
+    half *SB3 = SB2 + NI * KI;
+    half *SB4 = SB3 + NI * KI;
+    float *SC = reinterpret_cast<float *>(shared_storage);
 
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, wmmaM, wmmaN, wmmaK, half, nvcuda::wmma::row_major> FragA[MII / wmmaM];
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, wmmaM, wmmaN, wmmaK, half, nvcuda::wmma::col_major> FragB[NII / wmmaN];
@@ -154,22 +156,91 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     }
 
     // prologue
-    loadSmemA(SAs[0], A, M, K, 0);
-    loadSmemB(SBs[0], B, N, K, 0);
+    loadSmemA(SA1, A, M, K, 0);
+    loadSmemB(SB1, B, N, K, 0);
 
-    for (int ko = 0; ko < K / KI; ko += 1)
+    loadSmemA(SA2, A, M, K, 1);
+    loadSmemB(SB2, B, N, K, 1);
+
+    loadSmemA(SA3, A, M, K, 2);
+    loadSmemB(SB3, B, N, K, 2);
+
+    for (int ko = 0; ko < K / KI; ko += 4)
     {
         __syncthreads();
+        if (ko + 3 < K / KI)
+        {
+            loadSmemA(SA4, A, M, K, ko + 3);
+            loadSmemB(SB4, B, N, K, ko + 3);
+        }
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            loadFragA(FragA, SAs[ko % 2], ki);
-            loadFragB(FragB, SBs[ko % 2], ki);
-            if (ki == 0 && ko < K / KI)
+            loadFragA(FragA, SA1, ki);
+            loadFragB(FragB, SB1, ki);
+            for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
-                loadSmemA(SAs[ko % 2 + 1], A, M, K, ko);
-                loadSmemB(SBs[ko % 2 + 1], B, N, K, ko);
+                for (int nii = 0; nii < NII / wmmaN; nii += 1)
+                {
+                    // 16x16x16 for each wmma
+                    nvcuda::wmma::mma_sync(Accum[mii * (NII / wmmaN) + nii], FragA[mii], FragB[nii], Accum[mii * (NII / wmmaN) + nii]);
+                }
             }
+        }
+
+        __syncthreads();
+        if (ko + 4 < K / KI)
+        {
+            loadSmemA(SA1, A, M, K, ko + 4);
+            loadSmemB(SB1, B, N, K, ko + 4);
+        }
+        for (int ki = 0; ki < KI / KII; ki += 1)
+        {
+            // 64x64x16 mma for each warp
+            loadFragA(FragA, SA2, ki);
+            loadFragB(FragB, SB2, ki);
+            for (int mii = 0; mii < MII / wmmaM; mii += 1)
+            {
+                for (int nii = 0; nii < NII / wmmaN; nii += 1)
+                {
+                    // 16x16x16 for each wmma
+                    nvcuda::wmma::mma_sync(Accum[mii * (NII / wmmaN) + nii], FragA[mii], FragB[nii], Accum[mii * (NII / wmmaN) + nii]);
+                }
+            }
+        }
+
+        __syncthreads();
+        if (ko + 5 < K / KI)
+        {
+            loadSmemA(SA2, A, M, K, ko + 5);
+            loadSmemB(SB2, B, N, K, ko + 5);
+        }
+        for (int ki = 0; ki < KI / KII; ki += 1)
+        {
+            // 64x64x16 mma for each warp
+            loadFragA(FragA, SA3, ki);
+            loadFragB(FragB, SB3, ki);
+            for (int mii = 0; mii < MII / wmmaM; mii += 1)
+            {
+                for (int nii = 0; nii < NII / wmmaN; nii += 1)
+                {
+                    // 16x16x16 for each wmma
+                    nvcuda::wmma::mma_sync(Accum[mii * (NII / wmmaN) + nii], FragA[mii], FragB[nii], Accum[mii * (NII / wmmaN) + nii]);
+                }
+            }
+        }
+
+        __syncthreads();
+        if (ko + 6 < K / KI)
+        {
+            loadSmemA(SA3, A, M, K, ko + 6);
+            loadSmemB(SB3, B, N, K, ko + 6);
+        }
+        for (int ki = 0; ki < KI / KII; ki += 1)
+        {
+            // 64x64x16 mma for each warp
+            loadFragA(FragA, SA4, ki);
+            loadFragB(FragB, SB4, ki);
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)

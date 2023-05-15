@@ -7,7 +7,7 @@
 #include <string>
 #include <cassert>
 
-#define STAGES 1
+int STAGES = 1;
 
 extern __global__ void matmul(half *A, half *B, half *C, int M, int N, int K);
 
@@ -42,18 +42,21 @@ const int K = 2048;
 int main(int argc, char *argv[])
 {
 
-// if (argc > 1) {
-//     assert((argc - 1) % 2 == 0);
-//     for (int i = 1; i < argc; i+= 2) {
-//         char* key = argv[i];
-//         char* value = argv[i+1];
-//         std::string keys(key);
-//         if (keys == "stages") {
-//             STAGES = std::atoi(value);
-//             std::cout << "Setting to " << STAGES << " stages.\n";
-//         }
-//     }
-// }
+    if (argc > 1)
+    {
+        assert((argc - 1) % 2 == 0);
+        for (int i = 1; i < argc; i += 2)
+        {
+            char *key = argv[i];
+            char *value = argv[i + 1];
+            std::string keys(key);
+            if (keys == "stages")
+            {
+                STAGES = std::atoi(value);
+                std::cout << "Setting to " << STAGES << " stages.\n";
+            }
+        }
+    }
 #ifdef DEBUG
     std::cout << "Debugging using shape M=" << M << ", N=" << N << ", K=" << K << "\n";
 #else
@@ -140,7 +143,7 @@ int main(int argc, char *argv[])
     dim3 dimGrid(N / 128, M / 128);
 
 #ifndef DEBUG
-    int smem_size = (STAGES * 128 * 32 * 2 * 2 + 128 * 128 * 2);
+    int smem_size = MAX(STAGES * 128 * 32 * 2 * 2, 128 * 128 * 4);
     if (smem_size >= (48 << 10))
     {
         CUDA_CHECK(cudaFuncSetAttribute(matmul,
@@ -167,7 +170,7 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef DEBUG
-    int smem_size = (STAGES * 128 * 32 * 2 * 2 + 128 * 128 * 2);
+    int smem_size = MAX(STAGES * 128 * 32 * 2 * 2, 128 * 128 * 4);
     std::cout << "Using shared memory = " << (double)smem_size / 1e3 << " KB.\n";
     if (smem_size >= (48 << 10))
     {

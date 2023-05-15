@@ -8,7 +8,7 @@
 #include <cuda.h>
 
 const int MI = 128;
-const int NI = 128;
+// const int NI = 128;
 const int KI = 32;
 const int MII = 64;
 const int NII = 64;
@@ -138,7 +138,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     extern __shared__ uint8_t shared_storage[];
     half *SA = reinterpret_cast<half *>(shared_storage);
     half *SB = reinterpret_cast<half *>(shared_storage + MI * KI * sizeof(half));
-    float *SC = reinterpret_cast<float *>(shared_storage + MI * KI * sizeof(half) + NI * KI * sizeof(half));
+    float *SC = reinterpret_cast<float *>(shared_storage);
 
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, wmmaM, wmmaN, wmmaK, half, nvcuda::wmma::row_major> FragA[MII / wmmaM];
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, wmmaM, wmmaN, wmmaK, half, nvcuda::wmma::col_major> FragB[NII / wmmaN];
