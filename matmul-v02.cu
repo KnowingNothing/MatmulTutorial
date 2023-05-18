@@ -5,8 +5,8 @@
 
 // 3090
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 2.16845ms
-// TFLOPS: 54.5921
+// Running cost of CUDA kernel is 2.34522ms
+// TFLOPS: 50.4772
 
 #include <cuda_fp16.h>
 #include <mma.h>

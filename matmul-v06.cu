@@ -1,12 +1,6 @@
 // A100 PCIE 80GB
-// Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 1.1085ms
-// TFLOPS: 106.793
 
 // 3090
-// Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 1.97275ms
-// TFLOPS: 60.0076
 
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -30,7 +24,6 @@ __device__ void loadSmemA(half *smem, half *A, int M, int K, int ko)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    _Pragma("unroll")
     for (int i = 0; i < 4; ++i)
     {
         int row = i * 32 + tid / 4;
@@ -59,7 +52,6 @@ __device__ void loadSmemB(half *smem, half *B, int N, int K, int ko)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    _Pragma("unroll")
     for (int i = 0; i < 4; ++i)
     {
         int row = i * 32 + tid / 4;
@@ -89,7 +81,6 @@ __device__ void loadSmemC(float *smem, half *C, int M, int N)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    _Pragma("unroll")
     for (int i = 0; i < 128; ++i)
     {
         int row = i;
@@ -108,7 +99,6 @@ __device__ void storeSmemC(half *C, float *smem, int M, int N)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    _Pragma("unroll")
     for (int i = 0; i < 128; ++i)
     {
         int row = i;
@@ -122,20 +112,20 @@ __device__ void loadFragA(unsigned int *frag, half *smem, int ki)
 {
     // frag: [j, k]: [2, 2]
     // load 64x16
+    int tx = threadIdx.x;
     int tz = threadIdx.z;
-    _Pragma("unroll")
     for (int i = 0; i < 4; ++i)
     {
-        int row = tz * 64 + i * 16;
-        int col = ki * KII;
-        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16));
+        int row = tz * 64 + i * 16 + tx / 16 * 8 + tx % 8;
+        int col = ki * KII + tx / 8 % 2 * 8;
+        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
         uint32_t smem_ptr;
         asm(
             "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
             : "=r"(smem_ptr)
             : "l"(ptr));
         asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3])
+                     : "=r"(frag[i * 4 + 0]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
                      : "r"(smem_ptr));
     }
 }
@@ -144,20 +134,20 @@ __device__ void loadFragB(unsigned int *frag, half *smem, int ki)
 {
     // frag: [j, k]: []
     // load 64x16
+    int tx = threadIdx.x;
     int ty = threadIdx.y;
-    _Pragma("unroll")
     for (int i = 0; i < 4; ++i)
     {
-        int row = ty * 64 + i * 16;
-        int col = ki * KII;
-        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16));
+        int row = ty * 64 + i * 16 + tx / 16 * 8 + tx % 8;
+        int col = ki * KII + tx / 8 % 2 * 8;
+        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
         uint32_t smem_ptr;
         asm(
             "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
             : "=r"(smem_ptr)
             : "l"(ptr));
         asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3])
+                     : "=r"(frag[i * 4 + 0]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
                      : "r"(smem_ptr));
     }
 }
@@ -169,23 +159,19 @@ __device__ void storeAccum(float *ptr, float *frag)
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int tz = threadIdx.z;
-    _Pragma("unroll")
     for (int i = 0; i < 4; ++i)
     {
-        _Pragma("unroll")
         for (int j = 0; j < 4; ++j)
         {
-            _Pragma("unroll")
             for (int r = 0; r < 2; ++r)
-            {   
-                _Pragma("unroll")
+            {
                 for (int c = 0; c < 2; ++c)
                 {
                     int row = tz * 64 + i * 16 + r * 8 + tx / 4;
                     int col = ty * 64 + j * 16 + c * 8 + tx % 4 * 2;
                     float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16;
-                    dst[0] = frag[r * 4 + c * 2];
-                    dst[1] = frag[r * 2 + c * 2 + 1];
+                    dst[0] = frag[i * 32 + j * 8 + r * 4 + c * 2];
+                    dst[1] = frag[i * 32 + j * 8 + r * 4 + c * 2 + 1];
                 }
             }
         }
@@ -201,8 +187,8 @@ __device__ void mmaSync(unsigned int *fragA, unsigned int *fragB, float *accum)
         "{%8,  %9},"
         "{%10, %11, %12, %13};\n"
         : "=f"(accum[0]), "=f"(accum[1]), "=f"(accum[4]), "=f"(accum[5])
-        : "r"(fragA[0]), "r"(fragA[1]), "r"(fragA[2]), "r"(fragA[3]),
-          "r"(fragB[0]), "r"(fragB[2]),
+        : "r"(fragA[0]), "r"(fragA[2]), "r"(fragA[1]), "r"(fragA[3]),
+          "r"(fragB[0]), "r"(fragB[1]),
           "f"(accum[0]), "f"(accum[1]), "f"(accum[4]), "f"(accum[5]));
 
     asm volatile(
@@ -212,8 +198,8 @@ __device__ void mmaSync(unsigned int *fragA, unsigned int *fragB, float *accum)
         "{%8,  %9},"
         "{%10, %11, %12, %13};\n"
         : "=f"(accum[2]), "=f"(accum[3]), "=f"(accum[6]), "=f"(accum[7])
-        : "r"(fragA[0]), "r"(fragA[1]), "r"(fragA[2]), "r"(fragA[3]),
-          "r"(fragB[1]), "r"(fragB[3]),
+        : "r"(fragA[0]), "r"(fragA[2]), "r"(fragA[1]), "r"(fragA[3]),
+          "r"(fragB[2]), "r"(fragB[3]),
           "f"(accum[2]), "f"(accum[3]), "f"(accum[6]), "f"(accum[7]));
 }
 
@@ -235,11 +221,9 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     half *SB4 = SB3 + NI * KI;
     float *SC = reinterpret_cast<float *>(shared_storage);
 
-    unsigned int FragA[2 * 4];
-    unsigned int FragB[2 * 4];
-    unsigned int * FragAs[] = {FragA, FragA + 4};
-    unsigned int * FragBs[] = {FragB, FragB + 4};
-    float Accum[8] = {0.0};
+    unsigned int FragA[16];
+    unsigned int FragB[16];
+    float Accum[128] = {0.0};
 
     // prologue
     loadSmemA(SA1, A, M, K, 0);
@@ -258,111 +242,91 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        loadFragA(FragAs[0], SA1, 0);
-        loadFragB(FragBs[0], SB1, 0);
         if (ko + 3 < K / KI)
         {
             loadSmemA(SA4, A, M, K, ko + 3);
             loadSmemB(SB4, B, N, K, ko + 3);
             asm volatile("cp.async.commit_group;\n" ::);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            if (ki + 1 < KI / KII) {
-                loadFragA(FragAs[(ki + 1) % 2], SA1, ki + 1);
-                loadFragB(FragBs[(ki + 1) % 2], SB1, ki + 1);
-            }
+            loadFragA(FragA, SA1, ki);
+            loadFragB(FragB, SB1, ki);
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        loadFragA(FragAs[0], SA2, 0);
-        loadFragB(FragBs[0], SB2, 0);
         if (ko + 4 < K / KI)
         {
             loadSmemA(SA1, A, M, K, ko + 4);
             loadSmemB(SB1, B, N, K, ko + 4);
             asm volatile("cp.async.commit_group;\n" ::);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            if (ki + 1 < KI / KII) {
-                loadFragA(FragAs[(ki + 1) % 2], SA2, ki + 1);
-                loadFragB(FragBs[(ki + 1) % 2], SB2, ki + 1);
-            }
+            loadFragA(FragA, SA2, ki);
+            loadFragB(FragB, SB2, ki);
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        loadFragA(FragAs[0], SA3, 0);
-        loadFragB(FragBs[0], SB3, 0);
         if (ko + 5 < K / KI)
         {
             loadSmemA(SA2, A, M, K, ko + 5);
             loadSmemB(SB2, B, N, K, ko + 5);
             asm volatile("cp.async.commit_group;\n" ::);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            if (ki < KI / KII) {
-                loadFragA(FragAs[(ki + 1) % 2], SA3, ki + 1);
-                loadFragB(FragBs[(ki + 1) % 2], SB3, ki + 1);
-            }
+            loadFragA(FragA, SA3, ki);
+            loadFragB(FragB, SB3, ki);
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
 
         asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
         __syncthreads();
-        loadFragA(FragAs[0], SA4, 0);
-        loadFragB(FragBs[0], SB4, 0);
         if (ko + 6 < K / KI)
         {
             loadSmemA(SA3, A, M, K, ko + 6);
             loadSmemB(SB3, B, N, K, ko + 6);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
-            if (ki + 1 < KI / KII) {
-                loadFragA(FragAs[(ki + 1) % 2], SA4, ki + 1);
-                loadFragB(FragBs[(ki + 1) % 2], SB4, ki + 1);
-            }
+            loadFragA(FragA, SA4, ki);
+            loadFragB(FragB, SB4, ki);
             for (int mii = 0; mii < MII / wmmaM; mii += 1)
             {
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragAs[ki % 2], FragBs[ki % 2], Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
@@ -379,7 +343,6 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
             loadSmemB(SB4, B, N, K, ko + 3);
             asm volatile("cp.async.commit_group;\n" ::);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
@@ -390,7 +353,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
@@ -403,7 +366,6 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
             loadSmemB(SB1, B, N, K, ko + 4);
             asm volatile("cp.async.commit_group;\n" ::);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
@@ -414,7 +376,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
@@ -427,7 +389,6 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
             loadSmemB(SB2, B, N, K, ko + 5);
             asm volatile("cp.async.commit_group;\n" ::);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
@@ -438,7 +399,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
@@ -450,7 +411,6 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
             loadSmemA(SA3, A, M, K, ko + 6);
             loadSmemB(SB3, B, N, K, ko + 6);
         }
-        _Pragma("unroll")
         for (int ki = 0; ki < KI / KII; ki += 1)
         {
             // 64x64x16 mma for each warp
@@ -461,7 +421,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(FragA, FragB, Accum);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
                 }
             }
         }
