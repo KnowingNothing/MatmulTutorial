@@ -1,7 +1,9 @@
+// wmma + pipeline
+
 // A100 PCIE 80GB
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 0.89474ms
-// TFLOPS: 132.307
+// Running cost of CUDA kernel is 1.15745ms
+// TFLOPS: 102.277
 
 // 3090
 // Test performance using shape M=5376, N=5376, K=2048

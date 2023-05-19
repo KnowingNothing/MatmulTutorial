@@ -1,14 +1,8 @@
-// 2 mma + pipeline + ldmatrix
+// 2 mma + pipeline + ldmatrix + simplify
 
 // A100 PCIE 80GB
-// Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 1.47957ms
-// TFLOPS: 80.0096
 
 // 3090
-// Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 2.37636ms
-// TFLOPS: 49.8158
 
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -122,19 +116,20 @@ __device__ void loadFragA(unsigned int *frag, half *smem, int ki)
     // load 64x16
     int tx = threadIdx.x;
     int tz = threadIdx.z;
+    int row = tz * 64 + tx / 16 * 8 + tx % 8;
+    int col = ki * KII + tx / 8 % 2 * 8;
+    half *ptr = (smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
     for (int i = 0; i < 4; ++i)
     {
-        int row = tz * 64 + i * 16 + tx / 16 * 8 + tx % 8;
-        int col = ki * KII + tx / 8 % 2 * 8;
-        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
         uint32_t smem_ptr;
         asm(
             "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
             : "=r"(smem_ptr)
-            : "l"(ptr));
+            : "l"((void*)ptr));
         asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                      : "=r"(frag[i * 4 + 0]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
                      : "r"(smem_ptr));
+        ptr += 16 * 16 * 2;
     }
 }
 
@@ -167,22 +162,27 @@ __device__ void storeAccum(float *ptr, float *frag)
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int tz = threadIdx.z;
+    int row = tz * 64 + tx / 4;
+    int col = ty * 64 + tx % 4 * 2;
+    float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16;
     for (int i = 0; i < 4; ++i)
     {
-        for (int j = 0; j < 4; ++j)
-        {
-            for (int r = 0; r < 2; ++r)
-            {
-                for (int c = 0; c < 2; ++c)
-                {
-                    int row = tz * 64 + i * 16 + r * 8 + tx / 4;
-                    int col = ty * 64 + j * 16 + c * 8 + tx % 4 * 2;
-                    float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16;
-                    dst[0] = frag[i * 32 + j * 8 + r * 4 + c * 2];
-                    dst[1] = frag[i * 32 + j * 8 + r * 4 + c * 2 + 1];
-                }
-            }
+        for (int j = 0; j < 4; ++j) {
+            dst[0] = frag[i * 32 + j * 8 + 0 * 4 + 0 * 2];
+            dst[1] = frag[i * 32 + j * 8 + 0 * 4 + 0 * 2 + 1];
+
+            dst[0 + 8] = frag[i * 32 + j * 8 + 0 * 4 + 1 * 2];
+            dst[1 + 8] = frag[i * 32 + j * 8 + 0 * 4 + 1 * 2 + 1];
+
+            dst[0 + 8 * 16] = frag[i * 32 + j * 8 + 1 * 4 + 0 * 2];
+            dst[1 + 8 * 16] = frag[i * 32 + j * 8 + 1 * 4 + 0 * 2 + 1];
+
+            dst[0 + 8 * 16 + 8] = frag[i * 32 + j * 8 + 1 * 4 + 1 * 2];
+            dst[1 + 8 * 16 + 8] = frag[i * 32 + j * 8 + 1 * 4 + 1 * 2 + 1];
+
+            dst += 16 * 16;
         }
+        dst += 4 * 16 * 16;
     }
 }
 

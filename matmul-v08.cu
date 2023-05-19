@@ -1,14 +1,13 @@
-// 2 mma + pipeline + ldmatrix
+// 2 mma + pipeline + simplify + double threading
 
 // A100 PCIE 80GB
+// Setting to 4 stages.
+// Setting to 2x threading.
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 1.47957ms
-// TFLOPS: 80.0096
+// Running cost of CUDA kernel is 1.34029ms
+// TFLOPS: 88.3243
 
 // 3090
-// Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 2.37636ms
-// TFLOPS: 49.8158
 
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -18,7 +17,7 @@ const int MI = 128;
 const int NI = 128;
 const int KI = 32;
 const int MII = 64;
-const int NII = 64;
+const int NII = 32;
 const int KII = 16;
 const int wmmaM = 16;
 const int wmmaN = 16;
@@ -31,10 +30,10 @@ __device__ void loadSmemA(half *smem, half *A, int M, int K, int ko)
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int tz = threadIdx.z;
-    int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 4; ++i)
+    int tid = tz * 128 + ty * 32 + tx;
+    for (int i = 0; i < 2; ++i)
     {
-        int row = i * 32 + tid / 4;
+        int row = i * 64 + tid / 4;
         int col = tid % 4 * 8;
         // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
 
@@ -59,10 +58,10 @@ __device__ void loadSmemB(half *smem, half *B, int N, int K, int ko)
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int tz = threadIdx.z;
-    int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 4; ++i)
+    int tid = tz * 128 + ty * 32 + tx;
+    for (int i = 0; i < 2; ++i)
     {
-        int row = i * 32 + tid / 4;
+        int row = i * 64 + tid / 4;
         int col = tid % 4 * 8;
         // layout: [row_out, col_out, row_in, col_in] = [8, 2, 16, 16]
 
@@ -88,11 +87,11 @@ __device__ void loadSmemC(float *smem, half *C, int M, int N)
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int tz = threadIdx.z;
-    int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 128; ++i)
+    int tid = tz * 128 + ty * 32 + tx;
+    for (int i = 0; i < 64; ++i)
     {
-        int row = i;
-        int col = tid;
+        int row = i * 2 + tid / 128;
+        int col = tid % 128;
         // layout: [row_out, col_out, row_in, col_in] = [8, 8, 16, 16]
         smem[row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16] = (float)(C[(by * 128 + row) * N + bx * 128 + col]);
     }
@@ -106,11 +105,11 @@ __device__ void storeSmemC(half *C, float *smem, int M, int N)
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int tz = threadIdx.z;
-    int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 128; ++i)
+    int tid = tz * 128 + ty * 32 + tx;
+    for (int i = 0; i < 64; ++i)
     {
-        int row = i;
-        int col = tid;
+        int row = i * 2 + tid / 128;
+        int col = tid % 128;
         // layout: [row_out, col_out, row_in, col_in] = [8, 8, 16, 16]
         (C[(by * 128 + row) * N + bx * 128 + col]) = (half)smem[row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16];
     }
@@ -122,67 +121,69 @@ __device__ void loadFragA(unsigned int *frag, half *smem, int ki)
     // load 64x16
     int tx = threadIdx.x;
     int tz = threadIdx.z;
+    int row = tz * 64 + tx / 4;
+    int col = ki * KII + tx % 4 * 2;
+    half *ptr = smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16;
     for (int i = 0; i < 4; ++i)
     {
-        int row = tz * 64 + i * 16 + tx / 16 * 8 + tx % 8;
-        int col = ki * KII + tx / 8 % 2 * 8;
-        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
-        uint32_t smem_ptr;
-        asm(
-            "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
-            : "=r"(smem_ptr)
-            : "l"(ptr));
-        asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(frag[i * 4 + 0]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
-                     : "r"(smem_ptr));
+        frag[i * 4 + 0] = *(reinterpret_cast<unsigned int *>(ptr));
+        frag[i * 4 + 1] = *(reinterpret_cast<unsigned int *>(ptr + 8));
+
+        frag[i * 4 + 2] = *(reinterpret_cast<unsigned int *>(ptr + 8 * 16));
+        frag[i * 4 + 3] = *(reinterpret_cast<unsigned int *>(ptr + 8 * 16 + 8));
+        ptr += 16 * 16 * 2;
     }
 }
 
 __device__ void loadFragB(unsigned int *frag, half *smem, int ki)
 {
     // frag: [j, k]: []
-    // load 64x16
+    // load 32x16
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    for (int i = 0; i < 4; ++i)
+    int row = ty * 32 + tx / 4;
+    int col = ki * KII + tx % 4 * 2;
+    half *ptr = smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16;
+    for (int i = 0; i < 2; ++i)
     {
-        int row = ty * 64 + i * 16 + tx / 16 * 8 + tx % 8;
-        int col = ki * KII + tx / 8 % 2 * 8;
-        void *ptr = (void *)(smem + row / 16 * (2 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16);
-        uint32_t smem_ptr;
-        asm(
-            "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
-            : "=r"(smem_ptr)
-            : "l"(ptr));
-        asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(frag[i * 4 + 0]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]), "=r"(frag[i * 4 + 3])
-                     : "r"(smem_ptr));
+        frag[i * 4 + 0] = *(reinterpret_cast<unsigned int *>(ptr));
+        frag[i * 4 + 1] = *(reinterpret_cast<unsigned int *>(ptr + 8));
+
+        frag[i * 4 + 2] = *(reinterpret_cast<unsigned int *>(ptr + 8 * 16));
+        frag[i * 4 + 3] = *(reinterpret_cast<unsigned int *>(ptr + 8 * 16 + 8));
+        ptr += 16 * 16 * 2;
     }
 }
 
 __device__ void storeAccum(float *ptr, float *frag)
 {
     // frag [r, c, _]: [2, 2, 2]
-    // store 64x64
+    // store 64x32
     int tx = threadIdx.x;
     int ty = threadIdx.y;
     int tz = threadIdx.z;
+    int row = tz * 64 + tx / 4;
+    int col = ty * 32 + tx % 4 * 2;
+    float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16;
     for (int i = 0; i < 4; ++i)
     {
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < 2; ++j)
         {
-            for (int r = 0; r < 2; ++r)
-            {
-                for (int c = 0; c < 2; ++c)
-                {
-                    int row = tz * 64 + i * 16 + r * 8 + tx / 4;
-                    int col = ty * 64 + j * 16 + c * 8 + tx % 4 * 2;
-                    float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row % 16 * 16 + col % 16;
-                    dst[0] = frag[i * 32 + j * 8 + r * 4 + c * 2];
-                    dst[1] = frag[i * 32 + j * 8 + r * 4 + c * 2 + 1];
-                }
-            }
+            dst[0] = frag[i * 16 + j * 8 + 0 * 4 + 0 * 2];
+            dst[1] = frag[i * 16 + j * 8 + 0 * 4 + 0 * 2 + 1];
+
+            dst[0 + 8] = frag[i * 16 + j * 8 + 0 * 4 + 1 * 2];
+            dst[1 + 8] = frag[i * 16 + j * 8 + 0 * 4 + 1 * 2 + 1];
+
+            dst[0 + 8 * 16] = frag[i * 16 + j * 8 + 1 * 4 + 0 * 2];
+            dst[1 + 8 * 16] = frag[i * 16 + j * 8 + 1 * 4 + 0 * 2 + 1];
+
+            dst[0 + 8 * 16 + 8] = frag[i * 16 + j * 8 + 1 * 4 + 1 * 2];
+            dst[1 + 8 * 16 + 8] = frag[i * 16 + j * 8 + 1 * 4 + 1 * 2 + 1];
+
+            dst += 16 * 16;
         }
+        dst += 6 * 16 * 16;
     }
 }
 
@@ -229,9 +230,9 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
     half *SB4 = SB3 + NI * KI;
     float *SC = reinterpret_cast<float *>(shared_storage);
 
-    unsigned int FragA[16];
-    unsigned int FragB[16];
-    float Accum[128] = {0.0};
+    unsigned int FragA[4 * 4];      // [4, 4]
+    unsigned int FragB[2 * 4];      // [2, 4]
+    float Accum[4 * 2 * 8] = {0.0}; // [4, 2, 8]
 
     // prologue
     loadSmemA(SA1, A, M, K, 0);
@@ -266,7 +267,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }
@@ -289,7 +290,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }
@@ -312,7 +313,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }
@@ -334,7 +335,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }
@@ -361,7 +362,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }
@@ -384,7 +385,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }
@@ -407,7 +408,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }
@@ -429,7 +430,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
                 for (int nii = 0; nii < NII / wmmaN; nii += 1)
                 {
                     // 16x16x16 for each wmma
-                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
+                    mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
                 }
             }
         }

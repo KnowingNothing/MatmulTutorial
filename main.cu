@@ -8,6 +8,7 @@
 #include <cassert>
 
 int STAGES = 1;
+int MULTI_THREADING = 1;
 
 extern __global__ void matmul(half *A, half *B, half *C, int M, int N, int K);
 
@@ -54,6 +55,11 @@ int main(int argc, char *argv[])
             {
                 STAGES = std::atoi(value);
                 std::cout << "Setting to " << STAGES << " stages.\n";
+            }
+            else if (keys == "multi_threading")
+            {
+                MULTI_THREADING = std::atoi(value);
+                std::cout << "Setting to " << MULTI_THREADING << "x threading.\n";
             }
         }
     }
@@ -139,7 +145,7 @@ int main(int argc, char *argv[])
     CUDA_CHECK(cudaMemcpy(dB, hB, K * N * 2, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dC, hC, M * N * 2, cudaMemcpyHostToDevice));
 
-    dim3 dimBlock(32, 2, 2);
+    dim3 dimBlock(32, 2 * MULTI_THREADING, 2);
     dim3 dimGrid(N / 128, M / 128);
 
 #ifndef DEBUG

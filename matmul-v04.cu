@@ -1,7 +1,9 @@
+// 4 mma + pipeline + ldmatrix
+
 // A100 PCIE 80GB
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 0.898625ms
-// TFLOPS: 131.735
+// Running cost of CUDA kernel is 1.48764ms
+// TFLOPS: 79.5756
 
 // 3090
 // Setting to 4 stages.

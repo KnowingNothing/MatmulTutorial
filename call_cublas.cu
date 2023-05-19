@@ -1,7 +1,7 @@
 // A100 PCIE 80GB
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CuBLAS is 0.58983ms
-// TFLOPS: 200.702
+// Running cost of CuBLAS is 0.784682ms
+// TFLOPS: 150.864
 
 // 3090
 // Test performance using shape M=5376, N=5376, K=2048

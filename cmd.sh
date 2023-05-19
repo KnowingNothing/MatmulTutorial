@@ -11,6 +11,11 @@ nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v02.cu main.cu -o test && .
 nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v03.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v04.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v05.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v06.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v07.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v08.cu main.cu -o test && ./test stages 4 multi_threading 2
+nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v09.cu main.cu -o test && ./test stages 4 multi_threading 2
+nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v10.cu main.cu -o test && ./test stages 4 multi_threading 2
 
 # test performance
 nvcc -arch=sm_80  matmul-v00.cu main.cu -o test && ./test
@@ -21,9 +26,19 @@ nvcc -arch=sm_80  matmul-v02.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_80  matmul-v03.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_80  matmul-v04.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_80  matmul-v05.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_80  matmul-v06.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_80  matmul-v07.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_80  matmul-v08.cu main.cu -o test && ./test stages 4 multi_threading 2
+nvcc -arch=sm_80  matmul-v09.cu main.cu -o test && ./test stages 4 multi_threading 2
+nvcc -arch=sm_80  matmul-v10.cu main.cu -o test && ./test stages 4 multi_threading 2
 
 nvcc -arch=sm_86  matmul-v01.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_86  matmul-v02.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_86  matmul-v03.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_86  matmul-v04.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_86  matmul-v05.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_86  matmul-v06.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_86  matmul-v07.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_86  matmul-v08.cu main.cu -o test && ./test stages 4 multi_threading 2
+nvcc -arch=sm_86  matmul-v09.cu main.cu -o test && ./test stages 4 multi_threading 2
+nvcc -arch=sm_86  matmul-v10.cu main.cu -o test && ./test stages 4 multi_threading 2
