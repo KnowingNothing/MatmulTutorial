@@ -3,6 +3,11 @@
 // A100 PCIE 80GB
 
 // 3090
+// Setting to 4 stages.
+// Testing iters = 200.
+// Test performance using shape M=5376, N=5376, K=2048
+// Running cost of CUDA kernel is 2.19174ms
+// TFLOPS: 54.0119
 
 #include <cuda_fp16.h>
 #include <mma.h>

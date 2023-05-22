@@ -5,8 +5,8 @@
 
 // 3090
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CuBLAS is 1.97178ms
-// TFLOPS: 60.0371
+// Running cost of CuBLAS is 1.80772ms
+// TFLOPS: 65.4859
 
 #include <cuda_fp16.h>
 #include <iostream>
