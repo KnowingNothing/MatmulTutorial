@@ -147,14 +147,14 @@ int main(int argc, char *argv[])
     CUDA_CHECK(cudaMemcpy(dC, hC, M * N * 2, cudaMemcpyHostToDevice));
 
     // warmup
-    // for (int i = 0; i < 10; ++i)
-    // {
-    //     gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, dA, K, dB, K, &beta, dC, M);
-    // }
+    for (int i = 0; i < 10; ++i)
+    {
+        gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, dA, K, dB, K, &beta, dC, M);
+    }
     cudaDeviceSynchronize();
     // auto start = std::chrono::high_resolution_clock::now();
     cudaEventRecord(start);
-    for (int i = 0; i < 20; ++i)
+    for (int i = 0; i < 200; ++i)
     {
         gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, dA, K, dB, K, &beta, dC, M);
     }
@@ -162,8 +162,8 @@ int main(int argc, char *argv[])
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    std::cout << "Running cost of CuBLAS is " << ms / 20.0 << "ms\n";
-    std::cout << "TFLOPS: " << (float)M * N * K * 2 / (ms / 20.0) * 1e3 / 1e12 << "\n";
+    std::cout << "Running cost of CuBLAS is " << ms / 200.0 << "ms\n";
+    std::cout << "TFLOPS: " << (float)M * N * K * 2 / (ms / 200.0) * 1e3 / 1e12 << "\n";
     // cudaDeviceSynchronize();
     // auto end = std::chrono::high_resolution_clock::now();
     // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

@@ -1,11 +1,11 @@
-// 2 mma + pipeline + double threading + smem crosswise + ldmatrix
+// 2 mma + pipeline + double threading + smem crosswise + ldmatrix + split K
 
 // A100 PCIE 80GB
 // Setting to 4 stages.
 // Setting to 2x threading.
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 1.10695ms
-// TFLOPS: 106.942
+// Running cost of CUDA kernel is 1.3483ms
+// TFLOPS: 87.7994
 
 // 3090
 
@@ -17,7 +17,7 @@ const int MI = 128;
 const int NI = 128;
 const int KI = 32;
 const int MII = 64;
-const int NII = 32;
+const int NII = 64;
 const int KII = 16;
 const int wmmaM = 16;
 const int wmmaN = 16;
@@ -81,8 +81,8 @@ __device__ __forceinline__ void loadSmemB(half *smem, half *B, int N, int K,
   }
 }
 
-__device__ __forceinline__ void loadSmemC(float *smem, half *C, int M, int N) {
-  // load 128 * 128
+__device__ __forceinline__ void storeSmemC(half *C, half *smem, int M, int N) {
+  // store 128 * 128
   int bx = blockIdx.x;
   int by = blockIdx.y;
   int tx = threadIdx.x;
@@ -92,51 +92,22 @@ __device__ __forceinline__ void loadSmemC(float *smem, half *C, int M, int N) {
   for (int i = 0; i < 64; ++i) {
     int row = i * 2 + tid / 128;
     int col = tid % 128;
-    smem[row * 128 + col] = (float)(C[(by * 128 + row) * N + bx * 128 + col]);
+    (C[(by * 128 + row) * N + bx * 128 + col]) =
+        (half)(smem[row * 256 + col * 2] + smem[row * 256 + col * 2 + 1]);
   }
 }
 
-__device__ __forceinline__ void storeSmemC(half *C, float *smem, int M, int N) {
-  // load 128 * 128
-  int bx = blockIdx.x;
-  int by = blockIdx.y;
-  int tx = threadIdx.x;
-  int ty = threadIdx.y;
-  int tz = threadIdx.z;
-  int tid = tz * 128 + ty * 32 + tx;
-  for (int i = 0; i < 64; ++i) {
-    int row = i * 2 + tid / 128;
-    int col = tid % 128;
-    (C[(by * 128 + row) * N + bx * 128 + col]) = (half)smem[row * 128 + col];
-  }
-}
-
-__device__ __forceinline__ void loadFragA(unsigned int *frag, half *smem,
-                                          int ki) {
+__device__ __forceinline__ void loadFragA(unsigned int *frag, half *smem) {
   // frag: [j, k]: [2, 2]
   // load 64x16
   int tx = threadIdx.x;
+  int ty = threadIdx.y;
   int tz = threadIdx.z;
-
-  // for (int i = 0; i < 4; ++i) {
-  //   for (int j = 0; j < 2; ++j) {
-  //     for (int k = 0; k < 2; ++k) {
-  //       int row = tz * 64 + i * 16 + j * 8 + tx / 4;
-  //       int col = ki * KII + k * 8 + tx % 4 * 2;
-  //       col = row % 2 * 32 + col;
-  //       row = row / 2;
-  //       col = col ^ ((row & 3) << 3);
-  //       unsigned int *ptr =
-  //           reinterpret_cast<unsigned int *>(smem + row * 64 + col);
-  //       frag[i * 4 + j * 2 + k] = ptr[0];
-  //     }
-  //   }
-  // }
 
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     int row = tz * 64 + i * 16 + tx / 16 * 8 + tx % 8;
-    int col = ki * KII + tx / 8 % 2 * 8;
+    int col = ty / 2 * KII + tx / 8 % 2 * 8;
     col = row % 2 * 32 + col;
     row = row / 2;
     col = col ^ (((row & 3) << 3));
@@ -154,32 +125,15 @@ __device__ __forceinline__ void loadFragA(unsigned int *frag, half *smem,
   }
 }
 
-__device__ __forceinline__ void loadFragB(unsigned int *frag, half *smem,
-                                          int ki) {
+__device__ __forceinline__ void loadFragB(unsigned int *frag, half *smem) {
   // frag: [j, k]: []
   // load 32x16
-  // int tx = threadIdx.x;
-  // int ty = threadIdx.y;
-  // for (int i = 0; i < 2; ++i) {
-  //   for (int j = 0; j < 2; ++j) {
-  //     for (int k = 0; k < 2; ++k) {
-  //       int row = ty * 32 + i * 16 + j * 8 + tx / 4;
-  //       int col = ki * KII + k * 8 + tx % 4 * 2;
-  //       col = row % 2 * 32 + col;
-  //       row = row / 2;
-  //       col = col ^ ((row & 3) << 3);
-  //       unsigned int *ptr =
-  //           reinterpret_cast<unsigned int *>(smem + row * 64 + col);
-  //       frag[i * 4 + j * 2 + k] = ptr[0];
-  //     }
-  //   }
-  // }
   int tx = threadIdx.x;
   int ty = threadIdx.y;
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    int row = ty * 32 + i * 16 + tx / 16 * 8 + tx % 8;
-    int col = ki * KII + tx / 8 % 2 * 8;
+  for (int i = 0; i < 4; ++i) {
+    int row = ty % 2 * 64 + i * 16 + tx / 16 * 8 + tx % 8;
+    int col = ty / 2 * KII + tx / 8 % 2 * 8;
     col = row % 2 * 32 + col;
     row = row / 2;
     col = col ^ (((row & 3) << 3));
@@ -197,41 +151,34 @@ __device__ __forceinline__ void loadFragB(unsigned int *frag, half *smem,
   }
 }
 
-__device__ __forceinline__ void storeAccum(float *ptr, float *frag) {
+__device__ __forceinline__ void storeAccum(half *ptr, float *frag) {
   // frag [r, c, _]: [2, 2, 2]
-  // store 64x32
+  // store 64x64
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int tz = threadIdx.z;
-  int row = tz * 64 + tx / 4;
-  int col = ty * 32 + tx % 4 * 2;
-  // float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row %
-  // 16 * 16 + col % 16;
-  float *dst = ptr + row * 128 + col;
+  // smem view is [128x2x128]
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      dst[0] = frag[i * 16 + j * 8 + 0 * 4 + 0 * 2];
-      dst[1] = frag[i * 16 + j * 8 + 0 * 4 + 0 * 2 + 1];
-
-      dst[0 + 8] = frag[i * 16 + j * 8 + 0 * 4 + 1 * 2];
-      dst[1 + 8] = frag[i * 16 + j * 8 + 0 * 4 + 1 * 2 + 1];
-
-      dst[0 + 8 * 128] = frag[i * 16 + j * 8 + 1 * 4 + 0 * 2];
-      dst[1 + 8 * 128] = frag[i * 16 + j * 8 + 1 * 4 + 0 * 2 + 1];
-
-      dst[0 + 8 * 128 + 8] = frag[i * 16 + j * 8 + 1 * 4 + 1 * 2];
-      dst[1 + 8 * 128 + 8] = frag[i * 16 + j * 8 + 1 * 4 + 1 * 2 + 1];
-
-      dst += 16;
+    for (int j = 0; j < 4; ++j) {
+      for (int r = 0; r < 2; ++r) {
+        for (int c = 0; c < 2; ++c) {
+          int row = tz * 64 + i * 16 + r * 8 + tx / 4;
+          int col = ty % 2 * 64 + j * 16 + c * 8 + tx % 4 * 2;
+          ptr[row * 256 + col * 2 + ty / 2] =
+              (half)frag[i * 32 + j * 8 + r * 4 + c * 2 + 0];
+          ptr[row * 256 + (col + 1) * 2 + ty / 2] =
+              (half)frag[i * 32 + j * 8 + r * 4 + c * 2 + 1];
+        }
+      }
     }
-    dst += 16 * 128 - 16 * 2;
   }
 }
 
 __device__ __forceinline__ void mmaSync(unsigned int *fragA,
                                         unsigned int *fragB, float *accum) {
+
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                "{%0,  %1,  %2,  %3},"
                "{%4,  %5,  %6,  %7},"
@@ -256,7 +203,7 @@ __device__ __forceinline__ void mmaSync(unsigned int *fragA,
 __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
   // A is row-major
   // B is col-major
-  // 128 threads [x, y, z] = [32, 2, 2]
+  // 128 threads [x, y, z] = [32, 4, 2]
   // threadblock mma: 128x128x32
   // warp mma: 64x64x16
   extern __shared__ uint8_t shared_storage[];
@@ -268,12 +215,17 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
   half *SB2 = SB1 + NI * KI;
   half *SB3 = SB2 + NI * KI;
   half *SB4 = SB3 + NI * KI;
-  float *SC = reinterpret_cast<float *>(shared_storage);
+  half *SC = reinterpret_cast<half *>(shared_storage);
 
-  unsigned int FragA[4 * 4]; // [4, 4]
-  unsigned int FragB[2 * 4]; // [2, 4]
+  unsigned int FragA1[4 * 4]; // [4, 4]
+  unsigned int FragB1[4 * 4]; // [4, 4]
+                              //   unsigned int FragA2[4 * 4];      // [4, 4]
+                              //   unsigned int FragB2[4 * 4];      // [4, 4]
 
-  float Accum[4 * 2 * 8] = {0.0}; // [4, 2, 8]
+  unsigned int *FragA[] = {FragA1};
+  unsigned int *FragB[] = {FragB1};
+
+  float Accum[4 * 4 * 8] = {0.0}; // [4, 4, 8]
 
   // prologue
   loadSmemA(SA1, A, M, K, 0);
@@ -289,92 +241,103 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
   asm volatile("cp.async.commit_group;\n" ::);
 
   for (int ko = 0; ko < K / KI - 4; ko += 4) {
+
     asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
     __syncthreads();
+
     if (ko + 3 < K / KI) {
       loadSmemA(SA4, A, M, K, ko + 3);
       loadSmemB(SB4, B, N, K, ko + 3);
       asm volatile("cp.async.commit_group;\n" ::);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA1, ki);
-      loadFragB(FragB, SB1, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA1);
+    loadFragB(FragB[0], SB1);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+    // }
 
     asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
     __syncthreads();
+
     if (ko + 4 < K / KI) {
       loadSmemA(SA1, A, M, K, ko + 4);
       loadSmemB(SB1, B, N, K, ko + 4);
       asm volatile("cp.async.commit_group;\n" ::);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA2, ki);
-      loadFragB(FragB, SB2, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA2);
+    loadFragB(FragB[0], SB2);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+    // }
 
     asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
     __syncthreads();
+
     if (ko + 5 < K / KI) {
       loadSmemA(SA2, A, M, K, ko + 5);
       loadSmemB(SB2, B, N, K, ko + 5);
       asm volatile("cp.async.commit_group;\n" ::);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA3, ki);
-      loadFragB(FragB, SB3, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA3);
+    loadFragB(FragB[0], SB3);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+    // }
 
     asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
     __syncthreads();
+
     if (ko + 6 < K / KI) {
       loadSmemA(SA3, A, M, K, ko + 6);
       loadSmemB(SB3, B, N, K, ko + 6);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA4, ki);
-      loadFragB(FragB, SB4, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA4);
+    loadFragB(FragB[0], SB4);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+
+    // }
   }
 
   // the last 4 iterations
   {
+
     int ko = (K / KI / 4 - 1) * 4;
     asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
     __syncthreads();
@@ -383,19 +346,20 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadSmemB(SB4, B, N, K, ko + 3);
       asm volatile("cp.async.commit_group;\n" ::);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA1, ki);
-      loadFragB(FragB, SB1, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA1);
+    loadFragB(FragB[0], SB1);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+    // }
 
     asm volatile("cp.async.wait_group %0;\n" ::"n"(2));
     __syncthreads();
@@ -404,19 +368,20 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadSmemB(SB1, B, N, K, ko + 4);
       asm volatile("cp.async.commit_group;\n" ::);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA2, ki);
-      loadFragB(FragB, SB2, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA2);
+    loadFragB(FragB[0], SB2);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+    // }
 
     asm volatile("cp.async.wait_group %0;\n" ::"n"(1));
     __syncthreads();
@@ -425,19 +390,20 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadSmemB(SB2, B, N, K, ko + 5);
       asm volatile("cp.async.commit_group;\n" ::);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA3, ki);
-      loadFragB(FragB, SB3, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA3);
+    loadFragB(FragB[0], SB3);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+    // }
 
     asm volatile("cp.async.wait_group %0;\n" ::"n"(0));
     __syncthreads();
@@ -445,19 +411,20 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadSmemA(SA3, A, M, K, ko + 6);
       loadSmemB(SB3, B, N, K, ko + 6);
     }
-    for (int ki = 0; ki < KI / KII; ki += 1) {
-      // 64x64x16 mma for each warp
-      loadFragA(FragA, SA4, ki);
-      loadFragB(FragB, SB4, ki);
+    // for (int ki = 0; ki < KI / KII; ki += 1) {
+    // 64x64x16 mma for each warp
+    loadFragA(FragA[0], SA4);
+    loadFragB(FragB[0], SB4);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+    for (int nii = 0; nii < NII / wmmaN; nii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
-          // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
-        }
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        // 16x16x16 for each wmma
+        mmaSync(&FragA[0][mii * 4], &FragB[0][nii * 4],
+                &Accum[mii * 32 + nii * 8]);
       }
     }
+    // }
   }
   storeAccum(SC, Accum);
   __syncthreads();

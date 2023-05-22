@@ -9,6 +9,7 @@
 
 int STAGES = 1;
 int MULTI_THREADING = 1;
+int ITERS = 20;
 
 extern __global__ void matmul(half *A, half *B, half *C, int M, int N, int K);
 
@@ -60,6 +61,10 @@ int main(int argc, char *argv[])
             {
                 MULTI_THREADING = std::atoi(value);
                 std::cout << "Setting to " << MULTI_THREADING << "x threading.\n";
+            }
+            else if (keys == "iters") {
+                ITERS = std::atoi(value);
+                std::cout << "Testing iters = " << ITERS << ".\n";
             }
         }
     }
@@ -160,14 +165,14 @@ int main(int argc, char *argv[])
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     // warmup
-    // for (int i = 0; i < 10; ++i)
-    // {
-    //     matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
-    // }
+    for (int i = 0; i < ITERS / 20 - 1; ++i)
+    {
+        matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
+    }
     cudaDeviceSynchronize();
     // auto start = std::chrono::high_resolution_clock::now();
     cudaEventRecord(start);
-    for (int i = 0; i < 20; ++i)
+    for (int i = 0; i < ITERS; ++i)
     {
         matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
     }
@@ -175,8 +180,8 @@ int main(int argc, char *argv[])
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    std::cout << "Running cost of CUDA kernel is " << ms / 20.0 << "ms\n";
-    std::cout << "TFLOPS: " << (float)M * N * K * 2 / (ms / 20.0) * 1e3 / 1e12 << "\n";
+    std::cout << "Running cost of CUDA kernel is " << double(ms) / ITERS << "ms\n";
+    std::cout << "TFLOPS: " << (float)M * N * K * 2 / (double(ms) / ITERS) * 1e3 / 1e12 << "\n";
     // cudaDeviceSynchronize();
     // auto end = std::chrono::high_resolution_clock::now();
     // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

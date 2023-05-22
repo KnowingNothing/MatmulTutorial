@@ -1,11 +1,10 @@
-// 2 mma + pipeline + double threading + smem crosswise + ldmatrix
+// 2 mma + pipeline + smem crosswise + partial ldmatrix
 
 // A100 PCIE 80GB
 // Setting to 4 stages.
-// Setting to 2x threading.
 // Test performance using shape M=5376, N=5376, K=2048
-// Running cost of CUDA kernel is 1.10695ms
-// TFLOPS: 106.942
+// Running cost of CUDA kernel is 0.893766ms
+// TFLOPS: 132.451
 
 // 3090
 
@@ -17,7 +16,7 @@ const int MI = 128;
 const int NI = 128;
 const int KI = 32;
 const int MII = 64;
-const int NII = 32;
+const int NII = 64;
 const int KII = 16;
 const int wmmaM = 16;
 const int wmmaN = 16;
@@ -30,12 +29,12 @@ __device__ __forceinline__ void loadSmemA(half *smem, half *A, int M, int K,
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int tz = threadIdx.z;
-  int tid = tz * 128 + ty * 32 + tx;
+  int tid = tz * 64 + ty * 32 + tx;
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    int logic_row = i * 64 + tid / 4;
+  for (int i = 0; i < 4; ++i) {
+    int logic_row = i * 32 + tid / 4;
     int logic_col = tid % 4 * 8;
-    int row = i * 32 + tid / 8;
+    int row = i * 16 + tid / 8;
     int col = tid % 8 * 8;
     col = col ^ (((row & 3) << 3));
     void *ptr = (void *)(smem + row * 64 + col);
@@ -59,12 +58,12 @@ __device__ __forceinline__ void loadSmemB(half *smem, half *B, int N, int K,
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int tz = threadIdx.z;
-  int tid = tz * 128 + ty * 32 + tx;
+  int tid = tz * 64 + ty * 32 + tx;
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    int logic_row = i * 64 + tid / 4;
+  for (int i = 0; i < 4; ++i) {
+    int logic_row = i * 32 + tid / 4;
     int logic_col = tid % 4 * 8;
-    int row = i * 32 + tid / 8;
+    int row = i * 16 + tid / 8;
     int col = tid / 4 % 2 * 32 + tid % 4 * 8;
     col = col ^ (((row & 3) << 3));
     void *ptr = (void *)(smem + row * 64 + col);
@@ -81,21 +80,6 @@ __device__ __forceinline__ void loadSmemB(half *smem, half *B, int N, int K,
   }
 }
 
-__device__ __forceinline__ void loadSmemC(float *smem, half *C, int M, int N) {
-  // load 128 * 128
-  int bx = blockIdx.x;
-  int by = blockIdx.y;
-  int tx = threadIdx.x;
-  int ty = threadIdx.y;
-  int tz = threadIdx.z;
-  int tid = tz * 128 + ty * 32 + tx;
-  for (int i = 0; i < 64; ++i) {
-    int row = i * 2 + tid / 128;
-    int col = tid % 128;
-    smem[row * 128 + col] = (float)(C[(by * 128 + row) * N + bx * 128 + col]);
-  }
-}
-
 __device__ __forceinline__ void storeSmemC(half *C, float *smem, int M, int N) {
   // load 128 * 128
   int bx = blockIdx.x;
@@ -103,10 +87,10 @@ __device__ __forceinline__ void storeSmemC(half *C, float *smem, int M, int N) {
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int tz = threadIdx.z;
-  int tid = tz * 128 + ty * 32 + tx;
-  for (int i = 0; i < 64; ++i) {
-    int row = i * 2 + tid / 128;
-    int col = tid % 128;
+  int tid = tz * 64 + ty * 32 + tx;
+  for (int i = 0; i < 128; ++i) {
+    int row = i;
+    int col = tid;
     (C[(by * 128 + row) * N + bx * 128 + col]) = (half)smem[row * 128 + col];
   }
 }
@@ -118,67 +102,71 @@ __device__ __forceinline__ void loadFragA(unsigned int *frag, half *smem,
   int tx = threadIdx.x;
   int tz = threadIdx.z;
 
-  // for (int i = 0; i < 4; ++i) {
-  //   for (int j = 0; j < 2; ++j) {
-  //     for (int k = 0; k < 2; ++k) {
-  //       int row = tz * 64 + i * 16 + j * 8 + tx / 4;
-  //       int col = ki * KII + k * 8 + tx % 4 * 2;
-  //       col = row % 2 * 32 + col;
-  //       row = row / 2;
-  //       col = col ^ ((row & 3) << 3);
-  //       unsigned int *ptr =
-  //           reinterpret_cast<unsigned int *>(smem + row * 64 + col);
-  //       frag[i * 4 + j * 2 + k] = ptr[0];
-  //     }
-  //   }
-  // }
-
-#pragma unroll
   for (int i = 0; i < 4; ++i) {
-    int row = tz * 64 + i * 16 + tx / 16 * 8 + tx % 8;
-    int col = ki * KII + tx / 8 % 2 * 8;
-    col = row % 2 * 32 + col;
-    row = row / 2;
-    col = col ^ (((row & 3) << 3));
-    void *ptr = (void *)(smem + row * 64 + col);
-    uint32_t smem_ptr;
-    asm("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 "
-        "%0, smem_ptr; }\n"
-        : "=r"(smem_ptr)
-        : "l"(ptr));
-    asm volatile(
-        "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-        : "=r"(frag[i * 4 + 0]), "=r"(frag[i * 4 + 1]), "=r"(frag[i * 4 + 2]),
-          "=r"(frag[i * 4 + 3])
-        : "r"(smem_ptr));
+    for (int j = 0; j < 2; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        int row = tz * 64 + i * 16 + j * 8 + tx / 4;
+        int col = ki * KII + k * 8 + tx % 4 * 2;
+        col = row % 2 * 32 + col;
+        row = row / 2;
+        col = col ^ ((row & 3) << 3);
+        unsigned int *ptr =
+            reinterpret_cast<unsigned int *>(smem + row * 64 + col);
+        frag[i * 4 + j * 2 + k] = ptr[0];
+      }
+    }
   }
+
+  // load 16x16 at a time
+  // #pragma unroll
+  //   for (int i = 0; i < 4; ++i) {
+  //     int row = tz * 64 + i * 16 + tx / 16 * 8 + tx % 8;
+  //     int col = ki * KII + tx / 8 % 2 * 8;
+  //     col = row % 2 * 32 + col;
+  //     row = row / 2;
+  //     col = col ^ (((row & 3) << 3));
+  //     void *ptr = (void *)(smem + row * 64 + col);
+  //     uint32_t smem_ptr;
+  //     asm("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64
+  //     "
+  //         "%0, smem_ptr; }\n"
+  //         : "=r"(smem_ptr)
+  //         : "l"(ptr));
+  //     asm volatile(
+  //         "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3},
+  //         [%4];\n" : "=r"(frag[i * 4 + 0]), "=r"(frag[i * 4 + 1]),
+  //         "=r"(frag[i * 4 + 2]),
+  //           "=r"(frag[i * 4 + 3])
+  //         : "r"(smem_ptr));
+  //   }
 }
 
 __device__ __forceinline__ void loadFragB(unsigned int *frag, half *smem,
                                           int ki) {
   // frag: [j, k]: []
-  // load 32x16
-  // int tx = threadIdx.x;
-  // int ty = threadIdx.y;
-  // for (int i = 0; i < 2; ++i) {
-  //   for (int j = 0; j < 2; ++j) {
-  //     for (int k = 0; k < 2; ++k) {
-  //       int row = ty * 32 + i * 16 + j * 8 + tx / 4;
-  //       int col = ki * KII + k * 8 + tx % 4 * 2;
-  //       col = row % 2 * 32 + col;
-  //       row = row / 2;
-  //       col = col ^ ((row & 3) << 3);
-  //       unsigned int *ptr =
-  //           reinterpret_cast<unsigned int *>(smem + row * 64 + col);
-  //       frag[i * 4 + j * 2 + k] = ptr[0];
-  //     }
-  //   }
-  // }
+  // load 64x16
   int tx = threadIdx.x;
   int ty = threadIdx.y;
+
+//   for (int i = 0; i < 4; ++i) {
+//     for (int j = 0; j < 2; ++j) {
+//       for (int k = 0; k < 2; ++k) {
+//         int row = ty * 64 + i * 16 + j * 8 + tx / 4;
+//         int col = ki * KII + k * 8 + tx % 4 * 2;
+//         col = row % 2 * 32 + col;
+//         row = row / 2;
+//         col = col ^ ((row & 3) << 3);
+//         unsigned int *ptr =
+//             reinterpret_cast<unsigned int *>(smem + row * 64 + col);
+//         frag[i * 4 + j * 2 + k] = ptr[0];
+//       }
+//     }
+//   }
+
+// load 16x16 at a time
 #pragma unroll
-  for (int i = 0; i < 2; ++i) {
-    int row = ty * 32 + i * 16 + tx / 16 * 8 + tx % 8;
+  for (int i = 0; i < 4; ++i) {
+    int row = ty * 64 + i * 16 + tx / 16 * 8 + tx % 8;
     int col = ki * KII + tx / 8 % 2 * 8;
     col = row % 2 * 32 + col;
     row = row / 2;
@@ -199,34 +187,58 @@ __device__ __forceinline__ void loadFragB(unsigned int *frag, half *smem,
 
 __device__ __forceinline__ void storeAccum(float *ptr, float *frag) {
   // frag [r, c, _]: [2, 2, 2]
-  // store 64x32
+  // store 64x64
+  //   int tx = threadIdx.x;
+  //   int ty = threadIdx.y;
+  //   int tz = threadIdx.z;
+  //   int row = tz * 64 + tx / 4;
+  //   int col = ty * 64 + tx % 4 * 2;
+  //   // float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) +
+  //   row %
+  //   // 16 * 16 + col % 16;
+  //   float *dst = ptr + row * 128 + col;
+  // #pragma unroll
+  //   for (int i = 0; i < 4; ++i) {
+  // #pragma unroll
+  //     for (int j = 0; j < 4; ++j) {
+  //       dst[0] = frag[i * 32 + j * 8 + 0 * 4 + 0 * 2];
+  //       dst[1] = frag[i * 32 + j * 8 + 0 * 4 + 0 * 2 + 1];
+
+  //       dst[0 + 8] = frag[i * 32 + j * 8 + 0 * 4 + 1 * 2];
+  //       dst[1 + 8] = frag[i * 32 + j * 8 + 0 * 4 + 1 * 2 + 1];
+
+  //       dst[0 + 8 * 128] = frag[i * 32 + j * 8 + 1 * 4 + 0 * 2];
+  //       dst[1 + 8 * 128] = frag[i * 32 + j * 8 + 1 * 4 + 0 * 2 + 1];
+
+  //       dst[0 + 8 * 128 + 8] = frag[i * 32 + j * 8 + 1 * 4 + 1 * 2];
+  //       dst[1 + 8 * 128 + 8] = frag[i * 32 + j * 8 + 1 * 4 + 1 * 2 + 1];
+
+  //       dst += 16;
+  //     }
+  //     dst += 16 * 128 - 16 * 4;
+  //   }
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int tz = threadIdx.z;
-  int row = tz * 64 + tx / 4;
-  int col = ty * 32 + tx % 4 * 2;
-  // float *dst = ptr + row / 16 * (8 * 16 * 16) + col / 16 * (16 * 16) + row %
-  // 16 * 16 + col % 16;
-  float *dst = ptr + row * 128 + col;
+  // smem view is [128x128]
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      dst[0] = frag[i * 16 + j * 8 + 0 * 4 + 0 * 2];
-      dst[1] = frag[i * 16 + j * 8 + 0 * 4 + 0 * 2 + 1];
-
-      dst[0 + 8] = frag[i * 16 + j * 8 + 0 * 4 + 1 * 2];
-      dst[1 + 8] = frag[i * 16 + j * 8 + 0 * 4 + 1 * 2 + 1];
-
-      dst[0 + 8 * 128] = frag[i * 16 + j * 8 + 1 * 4 + 0 * 2];
-      dst[1 + 8 * 128] = frag[i * 16 + j * 8 + 1 * 4 + 0 * 2 + 1];
-
-      dst[0 + 8 * 128 + 8] = frag[i * 16 + j * 8 + 1 * 4 + 1 * 2];
-      dst[1 + 8 * 128 + 8] = frag[i * 16 + j * 8 + 1 * 4 + 1 * 2 + 1];
-
-      dst += 16;
+    for (int j = 0; j < 4; ++j) {
+      for (int r = 0; r < 2; ++r) {
+        for (int c = 0; c < 2; ++c) {
+          int row = tz * 64 + i * 16 + r * 8 + tx / 4;
+          int col = ty * 64 + j * 16 + c * 8 + tx % 4 * 2;
+          //   float2* dst = reinterpret_cast<float2*>(ptr + row * 128 + col);
+          //   float2 tmp;
+          //   tmp.x = frag[i * 32 + j * 8 + r * 4 + c * 2 + 0];
+          //   tmp.y = frag[i * 32 + j * 8 + r * 4 + c * 2 + 1];
+          //   *dst = tmp;
+          ptr[row * 128 + col] = frag[i * 32 + j * 8 + r * 4 + c * 2 + 0];
+          ptr[row * 128 + (col + 1)] = frag[i * 32 + j * 8 + r * 4 + c * 2 + 1];
+        }
+      }
     }
-    dst += 16 * 128 - 16 * 2;
   }
 }
 
@@ -271,9 +283,9 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
   float *SC = reinterpret_cast<float *>(shared_storage);
 
   unsigned int FragA[4 * 4]; // [4, 4]
-  unsigned int FragB[2 * 4]; // [2, 4]
+  unsigned int FragB[4 * 4]; // [4, 4]
 
-  float Accum[4 * 2 * 8] = {0.0}; // [4, 2, 8]
+  float Accum[4 * 4 * 8] = {0.0}; // [4, 4, 8]
 
   // prologue
   loadSmemA(SA1, A, M, K, 0);
@@ -301,11 +313,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA1, ki);
       loadFragB(FragB, SB1, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
@@ -322,11 +334,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA2, ki);
       loadFragB(FragB, SB2, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
@@ -343,11 +355,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA3, ki);
       loadFragB(FragB, SB3, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
@@ -363,11 +375,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA4, ki);
       loadFragB(FragB, SB4, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
@@ -388,11 +400,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA1, ki);
       loadFragB(FragB, SB1, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
@@ -409,11 +421,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA2, ki);
       loadFragB(FragB, SB2, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
@@ -430,11 +442,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA3, ki);
       loadFragB(FragB, SB3, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
@@ -450,11 +462,11 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
       loadFragA(FragA, SA4, ki);
       loadFragB(FragB, SB4, ki);
 #pragma unroll
-      for (int nii = 0; nii < NII / wmmaN; nii += 1) {
+      for (int mii = 0; mii < MII / wmmaM; mii += 1) {
 #pragma unroll
-        for (int mii = 0; mii < MII / wmmaM; mii += 1) {
+        for (int nii = 0; nii < NII / wmmaN; nii += 1) {
           // 16x16x16 for each wmma
-          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 16 + nii * 8]);
+          mmaSync(&FragA[mii * 4], &FragB[nii * 4], &Accum[mii * 32 + nii * 8]);
         }
       }
     }
