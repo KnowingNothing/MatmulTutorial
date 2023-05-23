@@ -1,4 +1,4 @@
-// wmma
+// wmma + fake pipeline
 
 // A100 PCIE 80GB
 // Test performance using shape M=5376, N=5376, K=2048
