@@ -7,6 +7,12 @@
 // TFLOPS: 110.744
 
 // 3090
+// Setting to 4 stages.
+// Testing iters = 200.
+// Setting to 2x threading.
+// Test performance using shape M=5376, N=5376, K=2048
+// Running cost of CUDA kernel is 1.93622ms
+// TFLOPS: 61.1399
 
 #include <cuda.h>
 #include <cuda_fp16.h>
