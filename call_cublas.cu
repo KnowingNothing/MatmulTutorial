@@ -58,20 +58,20 @@ inline cublasStatus_t
 gemm(cublasHandle_t handle,
      cublasOperation_t transA, cublasOperation_t transB,
      int m, int n, int k,
-     const half* alpha,
+     const float* alpha,
      const half* A, int ldA,
      const half* B, int ldB,
-     const half* beta,
+     const float* beta,
      half* C, int ldC)
 {
   return cublasGemmEx(handle, transA, transB,
                       m, n, k,
-                      reinterpret_cast<const __half*>(alpha),
+                      reinterpret_cast<const float*>(alpha),
                       reinterpret_cast<const __half*>(A), CUDA_R_16F, ldA,
                       reinterpret_cast<const __half*>(B), CUDA_R_16F, ldB,
-                      reinterpret_cast<const __half*>(beta),
+                      reinterpret_cast<const float*>(beta),
                       reinterpret_cast<      __half*>(C), CUDA_R_16F, ldC,
-                      CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 
@@ -131,8 +131,8 @@ int main(int argc, char *argv[])
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    half alpha = 1.0;
-    half beta = 0.0;
+    float alpha = 1.0;
+    float beta = 0.0;
 
     half *dA;
     half *dB;
