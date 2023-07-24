@@ -4,3 +4,4 @@ test_cublas
 *.o
 *.out
 *.log
+playground
