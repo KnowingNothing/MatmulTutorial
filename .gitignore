@@ -5,3 +5,4 @@ test_cublas
 *.out
 *.log
 playground
+ablation_test

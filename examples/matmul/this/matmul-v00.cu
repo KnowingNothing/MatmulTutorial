@@ -129,7 +129,7 @@ __device__ void storeAccum(float *ptr, nvcuda::wmma::fragment<nvcuda::wmma::accu
     }
 }
 
-__global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
+__global__ void matmul(half *A, half *B, half *C, int M, int N, int K, float alpha, float beta)
 {
     // A is row-major
     // B is col-major

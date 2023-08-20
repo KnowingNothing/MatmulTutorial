@@ -75,9 +75,9 @@ gemm(cublasHandle_t handle,
 }
 
 
-const int M = 5376;
-const int N = 5376;
-const int K = 2048;
+int M = 5376;
+int N = 5376;
+int K = 2048;
 #define MAX(a, b) (a) > (b) ? (a) : (b)
 
 /**
@@ -96,6 +96,24 @@ const int K = 2048;
 
 int main(int argc, char *argv[])
 {
+  if (argc > 1)
+  {
+      assert((argc - 1) % 2 == 0);
+      for (int i = 1; i < argc; i += 2)
+      {
+          char *key = argv[i];
+          char *value = argv[i + 1];
+          std::string keys(key);
+          if (keys == "M") {
+              M = std::atoi(value);
+          } else if (keys == "N") {
+              N = std::atoi(value);
+          } else if (keys == "K") {
+              K = std::atoi(value);
+          }
+      }
+  }
+
     std::cout << "Test performance using shape M=" << M << ", N=" << N << ", K=" << K << "\n";
     srand(time(NULL));
     half *hA = (half *)malloc(M * K * 2);
@@ -162,7 +180,7 @@ int main(int argc, char *argv[])
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
-    std::cout << "Running cost of CuBLAS is " << ms / 200.0 << "ms\n";
+    std::cout << "Running cost (ms) of CuBLAS is " << ms / 200.0 << "\n";
     std::cout << "TFLOPS: " << (float)M * N * K * 2 / (ms / 200.0) * 1e3 / 1e12 << "\n";
     // cudaDeviceSynchronize();
     // auto end = std::chrono::high_resolution_clock::now();

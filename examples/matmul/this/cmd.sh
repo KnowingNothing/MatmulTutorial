@@ -20,6 +20,7 @@ nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v11.cu main.cu -o test && .
 nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v12.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v13.cu main.cu -o test && ./test stages 4
 nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v14.cu main.cu -o test && ./test stages 4
+nvcc -arch=sm_80  -DDEBUG -Xcompiler -fopenmp matmul-v15.cu main.cu -o test && ./test stages 4
 
 # test performance
 nvcc -arch=sm_80  matmul-v00.cu main.cu -o test && ./test
@@ -39,6 +40,8 @@ nvcc -arch=sm_80  matmul-v11.cu main.cu -o test && ./test stages 4 multi_threadi
 nvcc -arch=sm_80  matmul-v12.cu main.cu -o test && ./test stages 4 iters 200
 nvcc -arch=sm_80  matmul-v13.cu main.cu -o test && ./test stages 4 iters 200
 nvcc -arch=sm_80  matmul-v14.cu main.cu -o test && ./test stages 4 iters 200
+nvcc -arch=sm_80  matmul-v15.cu main.cu -o test && ./test stages 4 iters 200
+nvcc -arch=sm_80  matmul-for-perf.cu test_this_perf.cu -o test_perf
 
 nvcc -arch=sm_86  matmul-v01.cu main.cu -o test && ./test stages 4 iters 200
 nvcc -arch=sm_86  matmul-v02.cu main.cu -o test && ./test stages 4 iters 200

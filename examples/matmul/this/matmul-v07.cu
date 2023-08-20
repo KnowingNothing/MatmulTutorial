@@ -221,7 +221,7 @@ __device__ void mmaSync(unsigned int *fragA, unsigned int *fragB, float *accum)
           "f"(accum[2]), "f"(accum[3]), "f"(accum[6]), "f"(accum[7]));
 }
 
-__global__ void matmul(half *A, half *B, half *C, int M, int N, int K)
+__global__ void matmul(half *A, half *B, half *C, int M, int N, int K, float alpha, float beta)
 {
     // A is row-major
     // B is col-major

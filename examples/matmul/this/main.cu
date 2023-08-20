@@ -11,7 +11,7 @@ int STAGES = 1;
 int MULTI_THREADING = 1;
 int ITERS = 20;
 
-extern __global__ void matmul(half *A, half *B, half *C, int M, int N, int K);
+extern __global__ void matmul(half *A, half *B, half *C, int M, int N, int K, float alpha, float beta);
 
 // #define DEBUG
 // #define PRINT
@@ -26,6 +26,9 @@ const int N = 5376;
 const int K = 2048;
 #endif
 #define MAX(a, b) (a) > (b) ? (a) : (b)
+
+float alpha = 1.0;
+float beta = 0.0;
 
 /**
  * Panic wrapper for unwinding CUDA runtime errors
@@ -167,14 +170,14 @@ int main(int argc, char *argv[])
     // warmup
     for (int i = 0; i < ITERS / 20 - 1; ++i)
     {
-        matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
+        matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K, alpha, beta);
     }
     cudaDeviceSynchronize();
     // auto start = std::chrono::high_resolution_clock::now();
     cudaEventRecord(start);
     for (int i = 0; i < ITERS; ++i)
     {
-        matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
+        matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K, alpha, beta);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -200,7 +203,7 @@ int main(int argc, char *argv[])
                                         smem_size));
     }
     std::cout << "Computing result values...\n";
-    matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K);
+    matmul<<<dimGrid, dimBlock, smem_size, nullptr>>>(dA, dB, dC, M, N, K, alpha, beta);
     CUDA_CHECK(cudaGetLastError());
     std::cout << "Computing results done!\n";
     CUDA_CHECK(cudaMemcpy(hC, dC, M * N * 2, cudaMemcpyDeviceToHost));
