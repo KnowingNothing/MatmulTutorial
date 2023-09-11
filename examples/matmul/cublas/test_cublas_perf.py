@@ -13,7 +13,7 @@ def build():
     for file in ["call_cublas.cu"]:
         assert os.path.exists(file) and os.path.isfile(
             file), "CUDA files not exist"
-    command = "nvcc -arch=sm_80  -lcublas call_cublas.cu -o test_cublas"
+    command = "nvcc -arch=sm_80 -lcublas call_cublas.cu -o test_cublas"
 
     p = subprocess.run(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
