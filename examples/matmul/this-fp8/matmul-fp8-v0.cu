@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <vector>
 
-/// RUN: nvcc -arch=sm_90a -std=c++17 -DDEBUG -Xcompiler -fopenmp matmul-fp8-v0.cu -o test && ./test
+/// RUN: nvcc -arch=sm_89 -std=c++17 -DDEBUG -Xcompiler -fopenmp matmul-fp8-v0.cu -o test && ./test
 
 typedef __nv_fp8_e5m2 e5m2;
 static constexpr int BLOCKM = 128;
@@ -459,7 +459,7 @@ struct MatmulKernel {
   }
 
   DEVICE void run(ADType *globalA, BDType *globalB, CDType *globalC) {
-    // naive_gemm(globalA, globalB, globalC);
+    /// naive_gemm(globalA, globalB, globalC);
     gemm_no_pipeline(globalA, globalB, globalC);
   }
 
@@ -698,6 +698,13 @@ const int K = 2048;
   }
 
 int main(int argc, char *argv[]) {
+
+  int runtime_version;
+  CUDA_CHECK(cudaRuntimeGetVersion(&runtime_version));
+  std::cout << "CUDA Runtime Version: " << runtime_version << "\n";
+  int driver_version;
+  CUDA_CHECK(cudaDriverGetVersion(&driver_version));
+  std::cout << "CUDA Driver Version: " << driver_version << "\n";
 
   if (argc > 1) {
     assert((argc - 1) % 2 == 0);
