@@ -83,11 +83,11 @@ def complex_matmul_bf16_kernel(
 
 def complex_matmul_bf16(ar, ai, br, bi):
     BLOCK_M = 64
-    BLOCK_N = 64
+    BLOCK_N = 32
     BLOCK_K = 32
-    GROUP_SIZE_M = 8
+    GROUP_SIZE_M = 2
     num_warps = 4
-    num_stages = 3
+    num_stages = 4
     M, K = ar.shape
     K, N = br.shape
     cr = torch.empty([M, N], device=ar.device, dtype=ar.dtype)
