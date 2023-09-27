@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import argparse
+from functools import reduce
 
 
 # @triton.autotune(
@@ -20,14 +21,17 @@ import argparse
 @triton.jit
 def complex_matmul_bf16_kernel(
     ar_ptr, ai_ptr, br_ptr, bi_ptr, cr_ptr, ci_ptr,
-    M, N, K,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+    batch_size, M, N, K,
+    stride_ab, stride_am, stride_ak,
+    stride_bb, stride_bk, stride_bn,
+    stride_cb, stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    bid = tl.program_id(axis=1)
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(GROUP_SIZE_M, num_pid_m - first_pid_m)
@@ -38,10 +42,10 @@ def complex_matmul_bf16_kernel(
     offset_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
     offset_k = tl.arange(0, BLOCK_K)
     
-    real_a_ptrs = ar_ptr + (offset_am[:, None] * stride_am + offset_k[None, :] * stride_ak)
-    image_a_ptrs = ai_ptr + (offset_am[:, None] * stride_am + offset_k[None, :] * stride_ak)
-    real_b_ptrs = br_ptr + (offset_k[:, None] * stride_bk + offset_bn[None, :] * stride_bn)
-    image_b_ptrs = bi_ptr + (offset_k[:, None] * stride_bk + offset_bn[None, :] * stride_bn)
+    real_a_ptrs = ar_ptr + bid * stride_ab + (offset_am[:, None] * stride_am + offset_k[None, :] * stride_ak)
+    image_a_ptrs = ai_ptr + bid * stride_ab + (offset_am[:, None] * stride_am + offset_k[None, :] * stride_ak)
+    real_b_ptrs = br_ptr + bid * stride_bb + (offset_k[:, None] * stride_bk + offset_bn[None, :] * stride_bn)
+    image_b_ptrs = bi_ptr + bid * stride_bb + (offset_k[:, None] * stride_bk + offset_bn[None, :] * stride_bn)
     
     real_real_accum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     image_image_accum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -74,8 +78,8 @@ def complex_matmul_bf16_kernel(
     
     offset_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offset_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    real_c_ptrs = cr_ptr + offset_cm[:, None] * stride_cm + offset_cn[None, :] * stride_cn
-    image_c_ptrs = ci_ptr + offset_cm[:, None] * stride_cm + offset_cn[None, :] * stride_cn
+    real_c_ptrs = cr_ptr + bid * stride_cb + offset_cm[:, None] * stride_cm + offset_cn[None, :] * stride_cn
+    image_c_ptrs = ci_ptr + bid * stride_cb + offset_cm[:, None] * stride_cm + offset_cn[None, :] * stride_cn
     c_mask = (offset_cm[:, None] < M) & (offset_cn[None, :] < N)
     tl.store(real_c_ptrs, real, mask=c_mask)
     tl.store(image_c_ptrs, image, mask=c_mask)
@@ -88,27 +92,34 @@ def complex_matmul_bf16(ar, ai, br, bi):
     GROUP_SIZE_M = 2
     num_warps = 4
     num_stages = 4
-    M, K = ar.shape
-    K, N = br.shape
-    cr = torch.empty([M, N], device=ar.device, dtype=ar.dtype)
-    ci = torch.empty([M, N], device=ai.device, dtype=ai.dtype)
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+    M, K = ar.shape[-2:]
+    K, N = br.shape[-2:]
+    batch_dims = ar.shape[:-2]
+    num_batch_dims = len(batch_dims)
+    batch_dim_size = reduce(lambda x, y: x * y, batch_dims, 1)
+    
+    cr = torch.empty([*batch_dims, M, N], device=ar.device, dtype=ar.dtype)
+    ci = torch.empty([*batch_dims, M, N], device=ai.device, dtype=ai.dtype)
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]), batch_dim_size)
     complex_matmul_bf16_kernel[grid](
         ar, ai, br, bi, cr, ci,
-        M, N, K,
-        ar.stride(0), ar.stride(1), br.stride(0), br.stride(1), cr.stride(0), cr.stride(1),
+        batch_dim_size, M, N, K,
+        0 if num_batch_dims < 1 else ar.stride(num_batch_dims-1), ar.stride(num_batch_dims + 0), ar.stride(num_batch_dims + 1),
+        0 if num_batch_dims < 1 else br.stride(num_batch_dims-1), br.stride(num_batch_dims + 0), br.stride(num_batch_dims + 1),
+        0 if num_batch_dims < 1 else cr.stride(num_batch_dims-1), cr.stride(num_batch_dims + 0), cr.stride(num_batch_dims + 1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_SIZE_M=GROUP_SIZE_M,
         num_warps=num_warps, num_stages=num_stages
     )
     return (cr, ci)
 
 
-def main(M, N, K):
+def main(M, N, K, batch_sizes=None):
+    batch_sizes = [] if batch_sizes is None else batch_sizes
     # torch.manual_seed(0)
-    ar = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
-    ai = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
-    br = torch.randn((K, N), device="cuda", dtype=torch.bfloat16)
-    bi = torch.randn((K, N), device="cuda", dtype=torch.bfloat16)
+    ar = torch.randn((*batch_sizes, M, K), device="cuda", dtype=torch.bfloat16)
+    ai = torch.randn((*batch_sizes, M, K), device="cuda", dtype=torch.bfloat16)
+    br = torch.randn((*batch_sizes, K, N), device="cuda", dtype=torch.bfloat16)
+    bi = torch.randn((*batch_sizes, K, N), device="cuda", dtype=torch.bfloat16)
     cr, ci = complex_matmul_bf16(ar, ai, br, bi)
     tcr = torch.matmul(ar, br) - torch.matmul(ai, bi)
     tci = torch.matmul(ai, br) + torch.matmul(ar, bi)
@@ -140,14 +151,15 @@ def main(M, N, K):
         elapsed_time_ms = start_event.elapsed_time(end_event)
         return elapsed_time_ms / iters
     
-    flops = M * N * K * 2 * 4 + M * N * 2
+    flops = (M * N * K * 2 * 4 + M * N * 2) * reduce(lambda x, y: x * y, batch_sizes, 1)
     print("Triton performance:", flops / perf(complex_matmul_bf16, (ar, ai, br, bi)) * 1e3 / 1e12, "TFLOPS")
     print("PyTorch performance:", flops / perf(lambda a, b, c, d: (torch.matmul(a, c) - torch.matmul(b, d), torch.matmul(a, d) + torch.matmul(b, c)), (ar, ai, br, bi)) * 1e3 / 1e12, "TFLOPS")
     
     
         
 if __name__ == "__main__":
-    M = 4096
-    N = 4096
-    K = 4096
-    main(M, N, K)
+    M = 1024
+    N = 1024
+    K = 64
+    batch_sizes = [8, 32]
+    main(M, N, K, batch_sizes=batch_sizes)
