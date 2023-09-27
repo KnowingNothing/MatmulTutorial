@@ -1,16 +1,20 @@
 import torch
 import triton
 import triton.language as tl
+import numpy as np
 
 DTYPE = tl.float32
 ACCUM_DTYPE = tl.float32
+TORCH_DTYPE = torch.float32
 INF = float("inf")
 NINF = float("-inf")
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 
 @triton.jit
 def linear_attention_fwd_kernel(
-    realQ, imageQ, realK, imageK, realV, imageV, realO, imageO,
+    realQ, imageQ, realK, imageK, realV, imageV, realO, imageO, realP, imageP,
     real_sm_scale, image_sm_scale,
     stride_qb, stride_qh, stride_qm, stride_qk,
     stride_kb, stride_kh, stride_km, stride_kk,
@@ -61,6 +65,22 @@ def linear_attention_fwd_kernel(
         strides=(stride_km, stride_kk),
         offsets=(batch_head_id * batch_row_stride_q, 0),
         block_shape=(BLOCK_N, BLOCK_K),
+        order=(1,0)
+    )
+    real_p_ptrs = tl.make_block_ptr(
+        base=realP,
+        shape=(batch_head_seqlen, seq_len),
+        strides=(seq_len, 1),
+        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1,0)
+    )
+    image_p_ptrs = tl.make_block_ptr(
+        base=imageP,
+        shape=(batch_head_seqlen, seq_len),
+        strides=(seq_len, 1),
+        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
         order=(1,0)
     )
     real_v_ptrs = tl.make_block_ptr(
@@ -129,6 +149,8 @@ def linear_attention_fwd_kernel(
         
         r_qk = rr_qk - ii_qk
         i_qk = ri_qk + ir_qk
+        tl.store(real_p_ptrs, r_qk, boundary_check=(0, 1))
+        tl.store(image_p_ptrs, i_qk, boundary_check=(0, 1))
         
         real_v = tl.load(real_v_ptrs, boundary_check=(0, 1))
         image_v = tl.load(image_v_ptrs, boundary_check=(0, 1))
@@ -142,6 +164,9 @@ def linear_attention_fwd_kernel(
         real_v_ptrs = tl.advance(real_v_ptrs, [BLOCK_N, 0])
         image_v_ptrs = tl.advance(image_v_ptrs, [BLOCK_N, 0])
         
+        real_p_ptrs = tl.advance(real_p_ptrs, [0, BLOCK_N])
+        image_p_ptrs = tl.advance(image_p_ptrs, [0, BLOCK_N])
+        
     rr_accum = rr_accum.to(DTYPE)
     ii_accum = ii_accum.to(DTYPE)
     ri_accum = ri_accum.to(DTYPE)
@@ -154,19 +179,21 @@ def linear_attention_fwd_kernel(
 
 
 def linear_attention_fwd(rq, iq, rk, ik, rv, iv, r_scale, i_scale):
-    BLOCK_M = 32
-    BLOCK_N = 32
-    BLOCK_K = 32
+    BLOCK_M = 16
+    BLOCK_N = 64
+    BLOCK_K = BLOCK_N
     batch_size, num_heads, seq_len, model_k = rq.shape
     assert BLOCK_K >= model_k
     # do some check for shape later...
     ro = torch.empty_like(rq)
     io = torch.empty_like(iq)
+    rp = torch.empty((batch_size, num_heads, seq_len, seq_len), device=rq.device, dtype=rq.dtype)
+    ip = torch.empty((batch_size, num_heads, seq_len, seq_len), device=iq.device, dtype=iq.dtype)
     grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads)
     num_warps = 4
     num_stages = 2
     linear_attention_fwd_kernel[grid](
-        rq, iq, rk, ik, rv, iv, ro, io,
+        rq, iq, rk, ik, rv, iv, ro, io, rp, ip,
         r_scale, i_scale,
         rq.stride(0), rq.stride(1), rq.stride(2), rq.stride(3),
         rk.stride(0), rk.stride(1), rk.stride(2), rk.stride(3),
@@ -176,22 +203,28 @@ def linear_attention_fwd(rq, iq, rk, ik, rv, iv, r_scale, i_scale):
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
         num_warps=num_warps, num_stages=num_stages
     )
-    return ro, io
+    return rp, ip, ro, io
 
 
 def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
-    torch.manual_seed(0)
-    rq = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=torch.float32)
-    iq = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=torch.float32)
-    rk = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=torch.float32)
-    ik = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=torch.float32)
-    rv = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=torch.float32)
-    iv = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=torch.float32)
-    ro, io = linear_attention_fwd(rq, iq, rk, ik, rv, iv, r_scale, i_scale)
+    # torch.manual_seed(20)
+    rq = torch.tensor(np.random.uniform(-1, 1, (batch_size, num_heads, seq_len, model_k)), device="cuda", dtype=TORCH_DTYPE)
+    iq = torch.tensor(np.random.uniform(-1, 1, (batch_size, num_heads, seq_len, model_k)), device="cuda", dtype=TORCH_DTYPE)
+    rk = torch.tensor(np.random.uniform(-1, 1, (batch_size, num_heads, seq_len, model_k)), device="cuda", dtype=TORCH_DTYPE)
+    ik = torch.tensor(np.random.uniform(-1, 1, (batch_size, num_heads, seq_len, model_k)), device="cuda", dtype=TORCH_DTYPE)
+    rv = torch.tensor(np.random.uniform(-1, 1, (batch_size, num_heads, seq_len, model_k)), device="cuda", dtype=TORCH_DTYPE)
+    iv = torch.tensor(np.random.uniform(-1, 1, (batch_size, num_heads, seq_len, model_k)), device="cuda", dtype=TORCH_DTYPE)
+    
+    # rq = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=TORCH_DTYPE)
+    # iq = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=TORCH_DTYPE)
+    # rk = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=TORCH_DTYPE)
+    # ik = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=TORCH_DTYPE)
+    # rv = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=TORCH_DTYPE)
+    # iv = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=TORCH_DTYPE)
+    rp, ip, ro, io = linear_attention_fwd(rq, iq, rk, ik, rv, iv, r_scale, i_scale)
     
     # reference impl
     def torch_impl(rq, iq, rk, ik, rv, iv, r_scale, i_scale):
-        torch.backends.cuda.matmul.allow_tf32 = False
         mask = torch.tril(torch.ones(seq_len, seq_len, device="cuda"))
         rp = torch.matmul(rq, rk.transpose(2, 3)) * r_scale - torch.matmul(iq, ik.transpose(2, 3)) * r_scale
         ip = torch.matmul(rq, ik.transpose(2, 3)) * i_scale + torch.matmul(iq, rk.transpose(2, 3)) * i_scale
@@ -199,18 +232,30 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         ip[:, :, mask == 0] = 0
         tro = torch.matmul(rp, rv) - torch.matmul(ip, iv)
         tio = torch.matmul(rp, iv) + torch.matmul(ip, rv)
-        return tro, tio
+        return rp, ip, tro, tio
     
-    tro, tio = torch_impl(rq, iq, rk, ik, rv, iv, r_scale, i_scale)
+    trp, tip, tro, tio = torch_impl(rq, iq, rk, ik, rv, iv, r_scale, i_scale)
     
-    if torch.allclose(ro, tro, atol=1, rtol=1e-1):
-        if  torch.allclose(io, tio, atol=1, rtol=1e-1):
+    if torch.allclose(trp, rp, atol=1e-2, rtol=1e-2):
+        if  torch.allclose(tip, ip, atol=1e-2, rtol=1e-2):
+            print("✅ Triton and Torch P match")
+        else:
+            print((ip - tip).abs().max())
+            print((ip - tip).abs().max()/tip.abs().mean())
+            print("❌ Triton and Torch P Image differ")
+    else:
+        print((rp - trp).abs().max())
+        print((rp - trp).abs().max()/trp.abs().mean())
+        print("❌ Triton and Torch P Real differ")
+    
+    if torch.allclose(ro, tro, atol=1e0, rtol=1e-1):
+        if  torch.allclose(io, tio, atol=1e0, rtol=1e-1):
             print("✅ Triton and Torch match")
         else:
+            print((io - tio).abs().max())
+            print((io - tio).abs().max()/tio.abs().mean())
             print("❌ Triton and Torch Image differ")
     else:
-        print(ro)
-        print(tro)
         print((ro - tro).abs().max())
         print((ro - tro).abs().max()/tro.abs().mean())
         print("❌ Triton and Torch Real differ")
@@ -234,12 +279,12 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     print("PyTorch average latency:", perf(torch_impl, (rq, iq, rk, ik, rv, iv, r_scale, i_scale)), "ms")
     
     
-batch_size = 4
-num_heads = 128
+batch_size = 1
+num_heads = 12
 seq_len = 1024
-model_k = 32
-r_scale = 0.2
-i_scale = 0.2
+model_k = 64
+r_scale = 1.0
+i_scale = 1.0
 main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale)
     
     
