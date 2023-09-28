@@ -11,6 +11,9 @@ NINF = float("-inf")
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
+print(torch.__version__)
+print(triton.__version__)
+
 
 @triton.jit
 def linear_attention_fwd_kernel(
@@ -127,10 +130,10 @@ def linear_attention_fwd_kernel(
         ri_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUM_DTYPE)
         ir_qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUM_DTYPE)
         
-        rr_qk += tl.dot(real_q, real_k)
-        ii_qk += tl.dot(image_q, image_k)
-        ri_qk += tl.dot(real_q, image_k)
-        ir_qk += tl.dot(image_q, real_k)
+        rr_qk += tl.dot(real_q, real_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        ii_qk += tl.dot(image_q, image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        ri_qk += tl.dot(real_q, image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        ir_qk += tl.dot(image_q, real_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         
         rr_qk *= real_sm_scale
         ii_qk *= real_sm_scale
@@ -154,10 +157,10 @@ def linear_attention_fwd_kernel(
         
         real_v = tl.load(real_v_ptrs, boundary_check=(0, 1))
         image_v = tl.load(image_v_ptrs, boundary_check=(0, 1))
-        rr_accum += tl.dot(r_qk, real_v)
-        ii_accum += tl.dot(i_qk, image_v)
-        ri_accum += tl.dot(r_qk, image_v)
-        ir_accum += tl.dot(i_qk, real_v)
+        rr_accum += tl.dot(r_qk, real_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        ii_accum += tl.dot(i_qk, image_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        ri_accum += tl.dot(r_qk, image_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        ir_accum += tl.dot(i_qk, real_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         
         real_k_ptrs = tl.advance(real_k_ptrs, [BLOCK_N, 0])
         image_k_ptrs = tl.advance(image_k_ptrs, [BLOCK_N, 0])
@@ -223,6 +226,8 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     # iv = torch.randn((batch_size, num_heads, seq_len, model_k), device="cuda", dtype=TORCH_DTYPE)
     rp, ip, ro, io = linear_attention_fwd(rq, iq, rk, ik, rv, iv, r_scale, i_scale)
     
+    # print(list(linear_attention_fwd_kernel.cache[0].values())[0].asm['ptx'])
+    
     # reference impl
     def torch_impl(rq, iq, rk, ik, rv, iv, r_scale, i_scale):
         mask = torch.tril(torch.ones(seq_len, seq_len, device="cuda"))
@@ -247,9 +252,12 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         print((rp - trp).abs().max())
         print((rp - trp).abs().max()/trp.abs().mean())
         print("❌ Triton and Torch P Real differ")
+        
+    triton.testing.assert_close(rp, trp, atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(ip, tip, atol=1e-2, rtol=1e-2)
     
-    if torch.allclose(ro, tro, atol=1e0, rtol=1e-1):
-        if  torch.allclose(io, tio, atol=1e0, rtol=1e-1):
+    if torch.allclose(ro, tro, atol=1e-2, rtol=1e-2):
+        if  torch.allclose(io, tio, atol=1e-2, rtol=1e-2):
             print("✅ Triton and Torch match")
         else:
             print((io - tio).abs().max())
@@ -259,6 +267,9 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         print((ro - tro).abs().max())
         print((ro - tro).abs().max()/tro.abs().mean())
         print("❌ Triton and Torch Real differ")
+        
+    triton.testing.assert_close(ro, tro, atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(io, tio, atol=1e-2, rtol=1e-2)
     
     def perf(func, args, iters=200):
         # warm-up
@@ -280,11 +291,9 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     
     
 batch_size = 1
-num_heads = 12
+num_heads = 48
 seq_len = 1024
 model_k = 64
 r_scale = 1.0
 i_scale = 1.0
 main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale)
-    
-    
