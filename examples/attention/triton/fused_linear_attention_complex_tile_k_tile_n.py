@@ -33,10 +33,10 @@ def linear_attention_fwd_kernel(
     
     offset_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offset_n = tl.arange(0, BLOCK_N)
-    rr_accum = tl.zeros([BLOCK_M, BLOCK_K*TILE_MODEL_K_PARTS], dtype=ACCUM_DTYPE)
-    ii_accum = tl.zeros([BLOCK_M, BLOCK_K*TILE_MODEL_K_PARTS], dtype=ACCUM_DTYPE)
-    ri_accum = tl.zeros([BLOCK_M, BLOCK_K*TILE_MODEL_K_PARTS], dtype=ACCUM_DTYPE)
-    ir_accum = tl.zeros([BLOCK_M, BLOCK_K*TILE_MODEL_K_PARTS], dtype=ACCUM_DTYPE)
+    rr_accum = tl.zeros([BLOCK_M, BLOCK_K], dtype=ACCUM_DTYPE)
+    ii_accum = tl.zeros([BLOCK_M, BLOCK_K], dtype=ACCUM_DTYPE)
+    ri_accum = tl.zeros([BLOCK_M, BLOCK_K], dtype=ACCUM_DTYPE)
+    ir_accum = tl.zeros([BLOCK_M, BLOCK_K], dtype=ACCUM_DTYPE)
     
     batch_row_stride_q = stride_qh // stride_qm // stride_qk
     batch_head_seqlen = batch_size*num_heads*seq_len
@@ -92,32 +92,32 @@ def linear_attention_fwd_kernel(
         base=realV,
         shape=(batch_head_seqlen, model_k),
         strides=(stride_vm, stride_vk),
-        offsets=(batch_head_id * batch_row_stride_q, 0),
-        block_shape=(BLOCK_N, BLOCK_K*TILE_MODEL_K_PARTS),
+        offsets=(batch_head_id * batch_row_stride_q, col_dim_id_o * BLOCK_K),
+        block_shape=(BLOCK_N, BLOCK_K),
         order=(1,0)
     )
     image_v_ptrs = tl.make_block_ptr(
         base=imageV,
         shape=(batch_head_seqlen, model_k),
         strides=(stride_vm, stride_vk),
-        offsets=(batch_head_id * batch_row_stride_q, 0),
-        block_shape=(BLOCK_N, BLOCK_K*TILE_MODEL_K_PARTS),
+        offsets=(batch_head_id * batch_row_stride_q, col_dim_id_o * BLOCK_K),
+        block_shape=(BLOCK_N, BLOCK_K),
         order=(1,0)
     )
     real_o_ptrs = tl.make_block_ptr(
         base=realO,
         shape=(batch_head_seqlen, model_k),
         strides=(stride_om, stride_ok),
-        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_K*TILE_MODEL_K_PARTS),
+        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, col_dim_id_o * BLOCK_K),
+        block_shape=(BLOCK_M, BLOCK_K),
         order=(1,0)
     )
     image_o_ptrs = tl.make_block_ptr(
         base=imageO,
         shape=(batch_head_seqlen, model_k),
         strides=(stride_om, stride_ok),
-        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_K*TILE_MODEL_K_PARTS),
+        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, col_dim_id_o * BLOCK_K),
+        block_shape=(BLOCK_M, BLOCK_K),
         order=(1,0)
     )
     
@@ -207,7 +207,7 @@ def linear_attention_fwd(rq, iq, rk, ik, rv, iv, r_scale, i_scale):
     io = torch.empty_like(iq)
     # rp = torch.empty((batch_size, num_heads, seq_len, seq_len), device=rq.device, dtype=rq.dtype)
     # ip = torch.empty((batch_size, num_heads, seq_len, seq_len), device=iq.device, dtype=iq.dtype)
-    grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads, 1)
+    grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads, TILE_MODEL_K_PARTS)
     num_warps = 4
     num_stages = 2
     linear_attention_fwd_kernel[grid](
