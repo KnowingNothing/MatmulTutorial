@@ -224,10 +224,10 @@ def linear_attention_bwd_kernel(
         
         # compute gp
         rv_T = tl.trans(tl.load(n_rv_ptrs, boundary_check=[0, 1]))
-        iv_N_T = -tl.trans(tl.load(n_iv_ptrs, boundary_check=[0, 1]))
+        iv_N_T = tl.trans(tl.load(n_iv_ptrs, boundary_check=[0, 1]))
         gov_rr = tl.dot(rgo, rv_T, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-        gov_ii = tl.dot(igo, iv_N_T, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-        gov_ri = tl.dot(rgo, iv_N_T, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        gov_ii = tl.dot(-igo, iv_N_T, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        gov_ri = tl.dot(rgo, -iv_N_T, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         gov_ir = tl.dot(igo, rv_T, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         
         gov_rr = gov_rr * real_sm_scale
@@ -248,8 +248,8 @@ def linear_attention_bwd_kernel(
         # igq = tl.load(igq_ptrs, boundary_check=(0, 1))
         
         gpk_rr = tl.dot(rgp, rk, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-        gpk_ii = tl.dot(igp, ik, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-        gpk_ri = tl.dot(rgp, ik, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        gpk_ii = tl.dot(igp, -ik, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        gpk_ri = tl.dot(rgp, -ik, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         gpk_ir = tl.dot(igp, rk, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         
         rgq = (gpk_rr.to(DTYPE) - gpk_ii.to(DTYPE))
@@ -263,13 +263,13 @@ def linear_attention_bwd_kernel(
         
         # compute gk
         rgp_T = tl.trans(rgp)
-        igp_N_T = -tl.trans(igp)
+        igp_N_T = tl.trans(igp)
         # rq = tl.load(rq_ptrs, boundary_check=(0, 1))
         # iq = tl.load(rq_ptrs, boundary_check=(0, 1))
         
         gpq_rr += tl.dot(rgp_T, rq, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-        gpq_ii += tl.dot(igp_N_T, iq, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-        gpq_ri += tl.dot(rgp_T, iq, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        gpq_ii += tl.dot(-igp_N_T, iq, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+        gpq_ri += tl.dot(rgp_T, -iq, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         gpq_ir += tl.dot(igp_N_T, rq, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         
         rq_ptrs = tl.advance(rq_ptrs, [BLOCK_M, 0])
@@ -297,7 +297,7 @@ def linear_attention_bwd(rq, iq, rk, ik, rv, iv, rgo, igo, r_scale, i_scale):
     batch_size, num_heads, seq_len, model_k = rq.shape
     BLOCK_M = 16
     BLOCK_N = 16
-    BLOCK_K = 128
+    BLOCK_K = 64
     # do some check for shape later...
     rgq = torch.zeros_like(rq)
     igq = torch.zeros_like(iq)
@@ -350,19 +350,40 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         ip = torch.matmul(rq, ik.transpose(2, 3)) * i_scale + torch.matmul(iq, rk.transpose(2, 3)) * i_scale
         rp[:, :, mask == 0] = 0
         ip[:, :, mask == 0] = 0
-        rgv = torch.matmul(rp.transpose(-2, -1), rgo) - torch.matmul(-ip.transpose(-2, -1), igo)
+        rgv = torch.matmul(rp.transpose(-2, -1), rgo) - torch.matmul(ip.transpose(-2, -1), -igo)
         igv = torch.matmul(rp.transpose(-2, -1), igo) + torch.matmul(-ip.transpose(-2, -1), rgo)
         rgp = torch.matmul(rgo, rv.transpose(-2, -1)) * r_scale - torch.matmul(igo, -iv.transpose(-2, -1)) * r_scale
         igp = torch.matmul(rgo, -iv.transpose(-2, -1)) * i_scale + torch.matmul(igo, rv.transpose(-2, -1)) * i_scale
         rgp[:, :, mask == 0] = 0
         igp[:, :, mask == 0] = 0
-        rgq = torch.matmul(rgp, rk) - torch.matmul(igp, ik)
-        igq = torch.matmul(rgp, ik) + torch.matmul(igp, rk)
+        rgq = torch.matmul(rgp, rk) - torch.matmul(igp, -ik)
+        igq = torch.matmul(rgp, -ik) + torch.matmul(igp, rk)
         rgk = torch.matmul(rgp.transpose(-2, -1), rq) - torch.matmul(-igp.transpose(-2, -1), iq)
-        igk = torch.matmul(-igp.transpose(-2, -1), rq) + torch.matmul(rgp.transpose(-2, -1), iq)
+        igk = torch.matmul(igp.transpose(-2, -1), rq) + torch.matmul(rgp.transpose(-2, -1), -iq)
         return rgq, igq, rgk, igk, rgv, igv # rgp, igp #, rp, ip, rgp, igp
     
     trgq, tigq, trgk, tigk, trgv, tigv = torch_impl(rq, iq, rk, ik, rv, iv, rgo, igo, r_scale, i_scale)
+    
+    def torch_c64_fwd_impl(q, k, v, r_scale, i_scale):
+        mask = torch.tril(torch.ones(seq_len, seq_len, device="cuda"))
+        p = torch.matmul(q, k.transpose(-2, -1))
+        p.real = p.real * r_scale
+        p.imag = p.imag * i_scale
+        p[:, :, mask == 0] = 0
+        o = torch.matmul(p, v)
+        return o
+    
+    q = torch.view_as_complex(torch.stack([rq, iq], dim=-1)).requires_grad_()
+    k = torch.view_as_complex(torch.stack([rk, ik], dim=-1)).requires_grad_()
+    v = torch.view_as_complex(torch.stack([rv, iv], dim=-1)).requires_grad_()
+    go = torch.view_as_complex(torch.stack([rgo, igo], dim=-1))
+    o = torch_c64_fwd_impl(q, k, v, r_scale, i_scale)
+    
+    def torch_c64_bwd_impl(q, k, v, o, go):
+        o.backward(go, retain_graph=True)
+        return q.grad.real.clone(), q.grad.imag.clone(), k.grad.real.clone(), k.grad.imag.clone(), v.grad.real.clone(), v.grad.imag.clone()
+    
+    crgq, cigq, crgk, cigk, crgv, cigv = torch_c64_bwd_impl(q, k, v, o, go)
     
     
     for tensor, torch_tensor, name in zip([rgv, igv, rgk, igk, rgq, igq], [trgv, tigv, trgk, tigk, trgq, tigq],
@@ -375,6 +396,19 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
             print((tensor - torch_tensor).abs().max())
             print((tensor - torch_tensor).abs().max()/torch_tensor.abs().mean())
             print(f"❌ Triton and Torch {name} differ")
+            
+        # triton.testing.assert_close(tensor, torch_tensor, atol=1e-2, rtol=1e-2)
+        
+    for tensor, torch_tensor, name in zip([trgv, tigv, trgk, tigk, trgq, tigq], [crgv, cigv, crgk, cigk, crgq, cigq],
+                                          ["Real GradV", "Image GradV",  "Real GradK", "Image GradK", "Real GradQ", "Image GradQ"]):
+        if  torch.allclose(tensor, torch_tensor, atol=1e-2, rtol=1e-2):
+            print(f"✅ Torch and Torch C64 {name} match")
+        else:
+            # print(tensor)
+            # print(torch_tensor)
+            print((tensor - torch_tensor).abs().max())
+            print((tensor - torch_tensor).abs().max()/torch_tensor.abs().mean())
+            print(f"❌ Torch and Torch C64 {name} differ")
             
         # triton.testing.assert_close(tensor, torch_tensor, atol=1e-2, rtol=1e-2)
     
@@ -395,12 +429,13 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     
     print("Triton average latency:", perf(linear_attention_bwd, (rq, iq, rk, ik, rv, iv, rgo, igo, r_scale, i_scale)), "ms")
     print("PyTorch average latency:", perf(torch_impl, (rq, iq, rk, ik, rv, iv, rgo, igo, r_scale, i_scale)), "ms")
+    print("PyTorch C64 average latency:", perf(torch_c64_bwd_impl, (q, k, v, o, go)), "ms")
     
     
 batch_size = 1
-num_heads = 48
+num_heads = 32
 seq_len = 1024*2
-model_k = 128
+model_k = 64
 r_scale = 1.0
 i_scale = 1.0
 main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale)
