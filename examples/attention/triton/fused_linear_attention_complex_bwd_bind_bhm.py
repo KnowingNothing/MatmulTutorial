@@ -389,7 +389,7 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     
     for tensor, torch_tensor, name in zip([rgv, igv, rgk, igk, rgq, igq], [trgv, tigv, trgk, tigk, trgq, tigq],
                                           ["Real GradV", "Image GradV",  "Real GradK", "Image GradK", "Real GradQ", "Image GradQ"]):
-        if  torch.allclose(tensor, torch_tensor, atol=1e-2, rtol=1e-2):
+        if  torch.allclose(tensor, torch_tensor, atol=1e-3, rtol=1e-3):
             print(f"✅ Triton and Torch {name} match")
         else:
             # print(tensor)
@@ -402,7 +402,7 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         
     for tensor, torch_tensor, name in zip([trgv, tigv, trgk, tigk, trgq, tigq], [crgv, cigv, crgk, cigk, crgq, cigq],
                                           ["Real GradV", "Image GradV",  "Real GradK", "Image GradK", "Real GradQ", "Image GradQ"]):
-        if  torch.allclose(tensor, torch_tensor, atol=1e-2, rtol=1e-2):
+        if  torch.allclose(tensor, torch_tensor, atol=1e-3, rtol=1e-3):
             print(f"✅ Torch and Torch C64 {name} match")
         else:
             # print(tensor)
