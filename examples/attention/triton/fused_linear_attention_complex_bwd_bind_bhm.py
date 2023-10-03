@@ -381,9 +381,10 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     
     def torch_c64_bwd_impl(q, k, v, o, go):
         o.backward(go, retain_graph=True)
-        return q.grad.real.clone(), q.grad.imag.clone(), k.grad.real.clone(), k.grad.imag.clone(), v.grad.real.clone(), v.grad.imag.clone()
+        return
     
-    crgq, cigq, crgk, cigk, crgv, cigv = torch_c64_bwd_impl(q, k, v, o, go)
+    torch_c64_bwd_impl(q, k, v, o, go)
+    crgq, cigq, crgk, cigk, crgv, cigv = q.grad.real.clone(), q.grad.imag.clone(), k.grad.real.clone(), k.grad.imag.clone(), v.grad.real.clone(), v.grad.imag.clone()
     
     
     for tensor, torch_tensor, name in zip([rgv, igv, rgk, igk, rgq, igq], [trgv, tigv, trgk, tigk, trgq, tigq],
