@@ -376,7 +376,7 @@ def linear_attention_bwd(rq, iq, rk, ik, rv, iv, rgo, igo, r_scale, i_scale):
     # rgp = torch.empty((batch_size, num_heads, seq_len, seq_len), device=rq.device, dtype=rq.dtype)
     # igp = torch.empty((batch_size, num_heads, seq_len, seq_len), device=iq.device, dtype=iq.dtype)
     grid = (batch_size * num_heads, 1)
-    num_warps = 4
+    num_warps = 16
     num_stages = 2
     linear_attention_bwd_kernel[grid](
         rq, iq, rk, ik, rv, iv, rgo, igo, # rp, ip,
@@ -458,7 +458,7 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
             
         triton.testing.assert_close(tensor, torch_tensor, atol=1e-2, rtol=1e-2)
     
-    def perf(func, args, iters=1):
+    def perf(func, args, iters=20):
         # warm-up
         outputs = func(*args)
         # Create CUDA events for measuring time
@@ -479,7 +479,7 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     
 batch_size = 1
 num_heads = 32
-seq_len = 1024
+seq_len = 1024*2
 model_k = 128
 r_scale = 1.0
 i_scale = 1.0

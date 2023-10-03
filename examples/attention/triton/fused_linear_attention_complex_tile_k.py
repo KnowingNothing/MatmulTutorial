@@ -306,7 +306,7 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     
     
 batch_size = 1
-num_heads = 48
+num_heads = 32
 seq_len = 1024*2
 model_k = 128
 r_scale = 1.0
