@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import numpy as np
+import math
 
 DTYPE = tl.float32
 ACCUM_DTYPE = tl.float32
@@ -180,6 +181,11 @@ def linear_attention_fwd_kernel(
         
         r_qk = rr_qk - ii_qk
         i_qk = ri_qk + ir_qk
+        scale = tl.full([BLOCK_M, BLOCK_N], model_k, DTYPE)
+        scale = tl.sqrt(scale)
+        scale = scale * (1 + start_n + tl.arange(0, BLOCK_N))
+        r_qk = r_qk / scale
+        i_qk = i_qk / scale
         # tl.store(real_p_ptrs, r_qk, boundary_check=(0, 1))
         # tl.store(image_p_ptrs, i_qk, boundary_check=(0, 1))
         
@@ -267,6 +273,9 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         ip = torch.matmul(rq, ik.transpose(2, 3)) * i_scale + torch.matmul(iq, rk.transpose(2, 3)) * i_scale
         rp[:, :, mask == 0] = 0
         ip[:, :, mask == 0] = 0
+        row_sum = math.sqrt(model_k) * torch.arange(1, seq_len + 1, device="cuda").unsqueeze(0).unsqueeze(0)
+        rp /= row_sum
+        ip /= row_sum
         tro = torch.matmul(rp, rv) - torch.matmul(ip, iv)
         tio = torch.matmul(rp, iv) + torch.matmul(ip, rv)
         return tro, tio

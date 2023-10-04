@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import numpy as np
+import math
 
 DTYPE = tl.float32
 ACCUM_DTYPE = tl.float32
@@ -244,6 +245,12 @@ def linear_attention_bwd_kernel(
         rp = qk_rr - qk_ii
         ip = qk_ri + qk_ir
         
+        scale = tl.full([BLOCK_M, BLOCK_N], model_k, DTYPE)
+        scale = tl.sqrt(scale)
+        scale = scale * (1 + start_n * BLOCK_N + tl.arange(0, BLOCK_N))
+        rp = rp / scale
+        ip = ip / scale
+        
         # tl.store(rp_ptrs, rp)
         # tl.store(ip_ptrs, ip)
         
@@ -279,6 +286,9 @@ def linear_attention_bwd_kernel(
         
         rgp = (gov_rr.to(DTYPE) - gov_ii.to(DTYPE))
         igp = (gov_ri.to(DTYPE) + gov_ir.to(DTYPE))
+        
+        rgp = rgp / scale
+        igp = igp / scale
         
         # compute gq
         # rgq = tl.load(rgq_ptrs, boundary_check=(0, 1))
@@ -394,12 +404,17 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         ip = torch.matmul(rq, ik.transpose(2, 3)) * i_scale + torch.matmul(iq, rk.transpose(2, 3)) * i_scale
         rp[:, :, mask == 0] = 0
         ip[:, :, mask == 0] = 0
+        row_sum = math.sqrt(model_k) * torch.arange(1, seq_len + 1, device="cuda").unsqueeze(0).unsqueeze(0)
+        rp /= row_sum
+        ip /= row_sum
         rgv = torch.matmul(rp.transpose(-2, -1), rgo) - torch.matmul(ip.transpose(-2, -1), -igo)
         igv = torch.matmul(rp.transpose(-2, -1), igo) + torch.matmul(-ip.transpose(-2, -1), rgo)
         rgp = torch.matmul(rgo, rv.transpose(-2, -1)) * r_scale - torch.matmul(igo, -iv.transpose(-2, -1)) * r_scale
         igp = torch.matmul(rgo, -iv.transpose(-2, -1)) * i_scale + torch.matmul(igo, rv.transpose(-2, -1)) * i_scale
         rgp[:, :, mask == 0] = 0
         igp[:, :, mask == 0] = 0
+        rgp /= row_sum
+        igp /= row_sum
         rgq = torch.matmul(rgp, rk) - torch.matmul(igp, -ik)
         igq = torch.matmul(rgp, -ik) + torch.matmul(igp, rk)
         rgk = torch.matmul(rgp.transpose(-2, -1), rq) - torch.matmul(-igp.transpose(-2, -1), iq)
@@ -414,6 +429,9 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
         p.real = p.real * r_scale
         p.imag = p.imag * i_scale
         p[:, :, mask == 0] = 0
+        row_sum = math.sqrt(model_k) * torch.arange(1, seq_len + 1, device="cuda").unsqueeze(0).unsqueeze(0)
+        p.real /= row_sum
+        p.imag /= row_sum
         o = torch.matmul(p, v)
         return o
     
@@ -480,7 +498,7 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
 if __name__ == "__main__":
     batch_size = 1
     num_heads = 32
-    seq_len = 1999
+    seq_len = 19
     model_k = 64
     r_scale = 1.0
     i_scale = 1.0
