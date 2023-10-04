@@ -151,8 +151,8 @@ def linear_attention_fwd_kernel(
             image_k = tl.trans(tl.load(k_image_k_ptrs, mask=(start_n + offset_n[:, None] < seq_len) & (start_k + offset_k[None, :] < model_k))) # boundary_check=(0,1))
             
             rr_qk += tl.dot(real_q, real_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-            ii_qk += tl.dot(image_q, image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
-            ri_qk += tl.dot(real_q, image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+            ii_qk += tl.dot(image_q, -image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
+            ri_qk += tl.dot(real_q, -image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
             ir_qk += tl.dot(image_q, real_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
             
             # k_real_q_ptrs = tl.advance(k_real_q_ptrs, [0, BLOCK_K])
@@ -269,8 +269,8 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     # reference impl
     def torch_impl(rq, iq, rk, ik, rv, iv, r_scale, i_scale):
         mask = torch.tril(torch.ones(seq_len, seq_len, device="cuda"))
-        rp = torch.matmul(rq, rk.transpose(2, 3)) * r_scale - torch.matmul(iq, ik.transpose(2, 3)) * r_scale
-        ip = torch.matmul(rq, ik.transpose(2, 3)) * i_scale + torch.matmul(iq, rk.transpose(2, 3)) * i_scale
+        rp = torch.matmul(rq, rk.transpose(2, 3)) * r_scale - torch.matmul(iq, -ik.transpose(2, 3)) * r_scale
+        ip = torch.matmul(rq, -ik.transpose(2, 3)) * i_scale + torch.matmul(iq, rk.transpose(2, 3)) * i_scale
         rp[:, :, mask == 0] = 0
         ip[:, :, mask == 0] = 0
         row_sum = math.sqrt(model_k) * torch.arange(1, seq_len + 1, device="cuda").unsqueeze(0).unsqueeze(0)
