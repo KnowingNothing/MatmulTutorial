@@ -1,9 +1,8 @@
-import math
 import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, List
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -21,38 +20,66 @@ linear_attention_bwd = fused_linear_attention_complex_bwd_bind_bhm_v2.linear_att
 
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def complex_elementwise_mul(
+    x_real: torch.Tensor,
+    x_imag: torch.Tensor,
+    y_real: torch.Tensor,
+    y_imag: torch.Tensor,
+) -> List[torch.Tensor]:
+    assert x_real.shape == x_imag.shape, f"x_real.shape={x_real.shape}, x_imag.shape={x_imag.shape}"
+    assert y_real.shape == y_imag.shape, f"y_real.shape={y_real.shape}, y_imag.shape={y_imag.shape}"
+    return [
+        x_real * y_real - x_imag * y_imag,
+        x_real * y_imag + x_imag * y_real
+    ]
 
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    
+def apply_rotary_pos_emb(x, cos, sin, position_ids, dagger=False):
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    cos = cos[..., :cos.shape[-1] // 2]
+    sin = sin[..., :sin.shape[-1] // 2]
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    if dagger:
+        x_real, x_imag = x[..., :x.shape[-1]//2], -x[..., x.shape[-1]//2:]
+        exponetial_real, exponetial_imag = cos, -sin
+    else:
+        x_real, x_imag = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        exponetial_real, exponetial_imag = cos, sin
+    result = complex_elementwise_mul(x_real, x_imag, exponetial_real, exponetial_imag)
+    return torch.cat(result, dim=-1)
 
     
 class ComputeAttn(torch.autograd.Function):
     @staticmethod
     def forward(qr, qi, kr, ki, vr, vi):
-        return linear_attention_fwd(qr, qi, kr, ki, vr, vi, 1, 1)
+        qr = qr.contiguous()
+        qi = qi.contiguous()
+        kr = kr.contiguous()
+        ki = ki.contiguous()
+        vr = vr.contiguous()
+        vi = vi.contiguous()
+        o_r, o_i = linear_attention_fwd(qr, qi, kr, ki, vr, vi, 1, 1)
+        return (o_r, o_i)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
         qr, qi, kr, ki, vr, vi = inputs
         o_r, o_i = output
-        ctx.save_for_backward(qr, qi, kr, ki, vr, vi, o_r, o_i)
+        ctx.save_for_backward(qr, qi, kr, ki, vr, vi)
 
     @staticmethod
     def backward(ctx, grad_o_r, grad_o_i):
-        qr, qi, kr, ki, vr, vi, _, _ = ctx.saved_tensors
+        qr, qi, kr, ki, vr, vi = ctx.saved_tensors
+        qr = qr.contiguous()
+        qi = qi.contiguous()
+        kr = kr.contiguous()
+        ki = ki.contiguous()
+        vr = vr.contiguous()
+        vi = vi.contiguous()
+        grad_o_r = grad_o_r.contiguous()
+        grad_o_i = grad_o_i.contiguous()
         grad_qr, grad_qi, grad_kr, grad_ki, grad_vr, grad_vi = linear_attention_bwd(
             qr, qi, kr, ki, vr, vi, grad_o_r, grad_o_i, 1, 1
         )
@@ -144,7 +171,8 @@ class FusedComplexLinearAttention(nn.Module):
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states = apply_rotary_pos_emb(query_states, cos, sin, position_ids, dagger=True)
+        key_states = apply_rotary_pos_emb(key_states, cos, sin, position_ids)
         if past_key_value is not None:
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -181,7 +209,7 @@ class FusedComplexLinearAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
         
-def replace_component(model: nn.Module) -> nn.Module:
+def replace_component_fused(model: nn.Module) -> nn.Module:
     for i, layer in enumerate(model.model.layers):
         device = layer.self_attn.q_proj.weight.device
         if isinstance(layer.self_attn, LlamaAttention):
@@ -195,7 +223,7 @@ if __name__ == '__main__':
         vocab_size=32000,
         hidden_size=4096,
         intermediate_size=11008,
-        num_hidden_layers=4,
+        num_hidden_layers=10,
         num_attention_heads=32,
         hidden_act="silu",
         max_position_embeddings=4096,
@@ -203,7 +231,7 @@ if __name__ == '__main__':
         rms_norm_eps=1e-6,
     )
     model = LlamaForCausalLM(config)
-    model = replace_component(model)
+    model = replace_component_fused(model)
     model = model.to('cuda').to(torch.float32)
     sample = "hello world"
     tokenizer = AutoTokenizer.from_pretrained("/root/share/datasets/llama-7b")
@@ -214,5 +242,5 @@ if __name__ == '__main__':
     print(f"Time: {time.perf_counter() - start}")
     # call backward to make sure the gradients are computed
     start = time.perf_counter()
-    output[0].backward(torch.randn_like(output[0]))
+    output[0].sum().backward()
     print(f"Time: {time.perf_counter() - start}")
