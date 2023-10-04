@@ -33,6 +33,7 @@ def linear_attention_fwd_kernel(
     
     offset_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offset_n = tl.arange(0, BLOCK_N)
+    offset_k = tl.arange(0, BLOCK_K)
     rr_accum = tl.zeros([BLOCK_M, BLOCK_K], dtype=ACCUM_DTYPE)
     ii_accum = tl.zeros([BLOCK_M, BLOCK_K], dtype=ACCUM_DTYPE)
     ri_accum = tl.zeros([BLOCK_M, BLOCK_K], dtype=ACCUM_DTYPE)
@@ -40,38 +41,42 @@ def linear_attention_fwd_kernel(
     
     batch_row_stride_q = stride_qh // stride_qm // stride_qk
     batch_head_seqlen = batch_size*num_heads*seq_len
-    real_q_ptrs = tl.make_block_ptr(
-        base=realQ,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_qm, stride_qk),
-        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_K),
-        order=(1,0)
-    )
-    image_q_ptrs = tl.make_block_ptr(
-        base=imageQ,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_qm, stride_qk),
-        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_K),
-        order=(1,0)
-    )
-    real_k_ptrs = tl.make_block_ptr(
-        base=realK,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_km, stride_kk),
-        offsets=(batch_head_id * batch_row_stride_q, 0),
-        block_shape=(BLOCK_N, BLOCK_K),
-        order=(1,0)
-    )
-    image_k_ptrs = tl.make_block_ptr(
-        base=imageK,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_km, stride_kk),
-        offsets=(batch_head_id * batch_row_stride_q, 0),
-        block_shape=(BLOCK_N, BLOCK_K),
-        order=(1,0)
-    )
+    # real_q_ptrs = tl.make_block_ptr(
+    #     base=realQ,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_qm, stride_qk),
+    #     offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
+    #     block_shape=(BLOCK_M, BLOCK_K),
+    #     order=(1,0)
+    # )
+    real_q_ptrs = realQ + (batch_head_id * batch_row_stride_q + start_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * stride_qm + tl.arange(0, BLOCK_K)[None, :]
+    # image_q_ptrs = tl.make_block_ptr(
+    #     base=imageQ,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_qm, stride_qk),
+    #     offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, 0),
+    #     block_shape=(BLOCK_M, BLOCK_K),
+    #     order=(1,0)
+    # )
+    image_q_ptrs = imageQ + (batch_head_id * batch_row_stride_q + start_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * stride_qm + tl.arange(0, BLOCK_K)[None, :]
+    # real_k_ptrs = tl.make_block_ptr(
+    #     base=realK,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_km, stride_kk),
+    #     offsets=(batch_head_id * batch_row_stride_q, 0),
+    #     block_shape=(BLOCK_N, BLOCK_K),
+    #     order=(1,0)
+    # )
+    real_k_ptrs = realK + (batch_head_id * batch_row_stride_q + tl.arange(0, BLOCK_N)[:, None]) * stride_km + tl.arange(0, BLOCK_K)[None, :]
+    # image_k_ptrs = tl.make_block_ptr(
+    #     base=imageK,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_km, stride_kk),
+    #     offsets=(batch_head_id * batch_row_stride_q, 0),
+    #     block_shape=(BLOCK_N, BLOCK_K),
+    #     order=(1,0)
+    # )
+    image_k_ptrs = imageK + (batch_head_id * batch_row_stride_q + tl.arange(0, BLOCK_N)[:, None]) * stride_km + tl.arange(0, BLOCK_K)[None, :]
     # real_p_ptrs = tl.make_block_ptr(
     #     base=realP,
     #     shape=(batch_head_seqlen, seq_len),
@@ -88,38 +93,42 @@ def linear_attention_fwd_kernel(
     #     block_shape=(BLOCK_M, BLOCK_K),
     #     order=(1,0)
     # )
-    real_v_ptrs = tl.make_block_ptr(
-        base=realV,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_vm, stride_vk),
-        offsets=(batch_head_id * batch_row_stride_q, col_dim_id_o * BLOCK_K),
-        block_shape=(BLOCK_N, BLOCK_K),
-        order=(1,0)
-    )
-    image_v_ptrs = tl.make_block_ptr(
-        base=imageV,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_vm, stride_vk),
-        offsets=(batch_head_id * batch_row_stride_q, col_dim_id_o * BLOCK_K),
-        block_shape=(BLOCK_N, BLOCK_K),
-        order=(1,0)
-    )
-    real_o_ptrs = tl.make_block_ptr(
-        base=realO,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_om, stride_ok),
-        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, col_dim_id_o * BLOCK_K),
-        block_shape=(BLOCK_M, BLOCK_K),
-        order=(1,0)
-    )
-    image_o_ptrs = tl.make_block_ptr(
-        base=imageO,
-        shape=(batch_head_seqlen, model_k),
-        strides=(stride_om, stride_ok),
-        offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, col_dim_id_o * BLOCK_K),
-        block_shape=(BLOCK_M, BLOCK_K),
-        order=(1,0)
-    )
+    # real_v_ptrs = tl.make_block_ptr(
+    #     base=realV,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_vm, stride_vk),
+    #     offsets=(batch_head_id * batch_row_stride_q, col_dim_id_o * BLOCK_K),
+    #     block_shape=(BLOCK_N, BLOCK_K),
+    #     order=(1,0)
+    # )
+    real_v_ptrs = realV + (batch_head_id * batch_row_stride_q + tl.arange(0, BLOCK_N)[:, None]) * stride_vm + (col_dim_id_o * BLOCK_K + tl.arange(0, BLOCK_K)[None, :]) * stride_vk
+    # image_v_ptrs = tl.make_block_ptr(
+    #     base=imageV,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_vm, stride_vk),
+    #     offsets=(batch_head_id * batch_row_stride_q, col_dim_id_o * BLOCK_K),
+    #     block_shape=(BLOCK_N, BLOCK_K),
+    #     order=(1,0)
+    # )
+    image_v_ptrs = imageV + (batch_head_id * batch_row_stride_q + tl.arange(0, BLOCK_N)[:, None]) * stride_vm + (col_dim_id_o * BLOCK_K + tl.arange(0, BLOCK_K)[None, :]) * stride_vk
+    # real_o_ptrs = tl.make_block_ptr(
+    #     base=realO,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_om, stride_ok),
+    #     offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, col_dim_id_o * BLOCK_K),
+    #     block_shape=(BLOCK_M, BLOCK_K),
+    #     order=(1,0)
+    # )
+    real_o_ptrs = realO + (batch_head_id * batch_row_stride_q + start_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * stride_om + (col_dim_id_o * BLOCK_K + tl.arange(0, BLOCK_K)[None, :]) * stride_ok
+    # image_o_ptrs = tl.make_block_ptr(
+    #     base=imageO,
+    #     shape=(batch_head_seqlen, model_k),
+    #     strides=(stride_om, stride_ok),
+    #     offsets=(batch_head_id * batch_row_stride_q + start_m * BLOCK_M, col_dim_id_o * BLOCK_K),
+    #     block_shape=(BLOCK_M, BLOCK_K),
+    #     order=(1,0)
+    # )
+    image_o_ptrs = imageO + (batch_head_id * batch_row_stride_q + start_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * stride_om + (col_dim_id_o * BLOCK_K + tl.arange(0, BLOCK_K)[None, :]) * stride_ok
     
     # real_q = tl.load(real_q_ptrs)
     # image_q = tl.load(image_q_ptrs)
@@ -135,20 +144,24 @@ def linear_attention_fwd_kernel(
         k_real_k_ptrs = real_k_ptrs
         k_image_k_ptrs = image_k_ptrs
         for start_k in range(0, TILE_MODEL_K_PARTS*BLOCK_K, BLOCK_K):
-            real_q = tl.load(k_real_q_ptrs, boundary_check=(0,1))
-            image_q = tl.load(k_image_q_ptrs, boundary_check=(0,1))
-            real_k = tl.trans(tl.load(k_real_k_ptrs, boundary_check=(0, 1)))
-            image_k = tl.trans(tl.load(k_image_k_ptrs, boundary_check=(0, 1)))
+            real_q = tl.load(k_real_q_ptrs, mask=(offset_m[:, None] < seq_len) & (start_k + offset_k[None, :] < model_k)) # boundary_check=(0,1))
+            image_q = tl.load(k_image_q_ptrs, mask=(offset_m[:, None] < seq_len) & (start_k + offset_k[None, :] < model_k)) # boundary_check=(0,1))
+            real_k = tl.trans(tl.load(k_real_k_ptrs, mask=(start_n + offset_n[:, None] < seq_len) & (start_k + offset_k[None, :] < model_k))) # boundary_check=(0,1))
+            image_k = tl.trans(tl.load(k_image_k_ptrs, mask=(start_n + offset_n[:, None] < seq_len) & (start_k + offset_k[None, :] < model_k))) # boundary_check=(0,1))
             
             rr_qk += tl.dot(real_q, real_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
             ii_qk += tl.dot(image_q, image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
             ri_qk += tl.dot(real_q, image_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
             ir_qk += tl.dot(image_q, real_k, allow_tf32=False, out_dtype=ACCUM_DTYPE)
             
-            k_real_q_ptrs = tl.advance(k_real_q_ptrs, [0, BLOCK_K])
-            k_image_q_ptrs = tl.advance(k_image_q_ptrs, [0, BLOCK_K])
-            k_real_k_ptrs = tl.advance(k_real_k_ptrs, [0, BLOCK_K])
-            k_image_k_ptrs = tl.advance(k_image_k_ptrs, [0, BLOCK_K])
+            # k_real_q_ptrs = tl.advance(k_real_q_ptrs, [0, BLOCK_K])
+            k_real_q_ptrs += BLOCK_K * stride_qk
+            # k_image_q_ptrs = tl.advance(k_image_q_ptrs, [0, BLOCK_K])
+            k_image_q_ptrs += BLOCK_K * stride_qk
+            # k_real_k_ptrs = tl.advance(k_real_k_ptrs, [0, BLOCK_K])
+            k_real_k_ptrs += BLOCK_K * stride_kk
+            # k_image_k_ptrs = tl.advance(k_image_k_ptrs, [0, BLOCK_K])
+            k_image_k_ptrs += BLOCK_K * stride_kk
         
         rr_qk *= real_sm_scale
         ii_qk *= real_sm_scale
@@ -170,17 +183,21 @@ def linear_attention_fwd_kernel(
         # tl.store(real_p_ptrs, r_qk, boundary_check=(0, 1))
         # tl.store(image_p_ptrs, i_qk, boundary_check=(0, 1))
         
-        real_v = tl.load(real_v_ptrs, boundary_check=(0, 1))
-        image_v = tl.load(image_v_ptrs, boundary_check=(0, 1))
+        real_v = tl.load(real_v_ptrs, mask=(start_n + offset_n[:, None] < seq_len) & (offset_k[None, :] < model_k)) # boundary_check=(0,1))
+        image_v = tl.load(image_v_ptrs, mask=(start_n + offset_n[:, None] < seq_len) & (offset_k[None, :] < model_k)) # boundary_check=(0,1))
         rr_accum += tl.dot(r_qk, real_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         ii_accum += tl.dot(i_qk, image_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         ri_accum += tl.dot(r_qk, image_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         ir_accum += tl.dot(i_qk, real_v, allow_tf32=False, out_dtype=ACCUM_DTYPE)
         
-        real_k_ptrs = tl.advance(real_k_ptrs, [BLOCK_N, 0])
-        image_k_ptrs = tl.advance(image_k_ptrs, [BLOCK_N, 0])
-        real_v_ptrs = tl.advance(real_v_ptrs, [BLOCK_N, 0])
-        image_v_ptrs = tl.advance(image_v_ptrs, [BLOCK_N, 0])
+        # real_k_ptrs = tl.advance(real_k_ptrs, [BLOCK_N, 0])
+        real_k_ptrs += BLOCK_N * stride_km
+        # image_k_ptrs = tl.advance(image_k_ptrs, [BLOCK_N, 0])
+        image_k_ptrs += BLOCK_N * stride_km
+        # real_v_ptrs = tl.advance(real_v_ptrs, [BLOCK_N, 0])
+        real_v_ptrs += BLOCK_N * stride_vm
+        # image_v_ptrs = tl.advance(image_v_ptrs, [BLOCK_N, 0])
+        image_v_ptrs += BLOCK_N * stride_vm
         
         # real_p_ptrs = tl.advance(real_p_ptrs, [0, BLOCK_N])
         # image_p_ptrs = tl.advance(image_p_ptrs, [0, BLOCK_N])
@@ -192,8 +209,8 @@ def linear_attention_fwd_kernel(
     
     real = rr_accum - ii_accum
     image = ri_accum + ir_accum
-    tl.store(real_o_ptrs, real, boundary_check=(0, 1))
-    tl.store(image_o_ptrs, image, boundary_check=(0, 1))
+    tl.store(real_o_ptrs, real, mask=(offset_m[:, None] < seq_len) & (offset_k[None, :] < model_k)) # boundary_check=(0,1))
+    tl.store(image_o_ptrs, image, mask=(offset_m[:, None] < seq_len) & (offset_k[None, :] < model_k)) # boundary_check=(0,1))
 
 
 def linear_attention_fwd(rq, iq, rk, ik, rv, iv, r_scale, i_scale):
@@ -304,11 +321,12 @@ def main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale):
     print("Triton average latency:", perf(linear_attention_fwd, (rq, iq, rk, ik, rv, iv, r_scale, i_scale)), "ms")
     print("PyTorch average latency:", perf(torch_impl, (rq, iq, rk, ik, rv, iv, r_scale, i_scale)), "ms")
     
-    
-batch_size = 1
-num_heads = 48
-seq_len = 1024*2
-model_k = 128
-r_scale = 1.0
-i_scale = 1.0
-main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale)
+
+if __name__ == "__main__":
+    batch_size = 1
+    num_heads = 32
+    seq_len = 16
+    model_k = 64
+    r_scale = 1.0
+    i_scale = 1.0
+    main(batch_size, num_heads, seq_len, model_k, r_scale, i_scale)

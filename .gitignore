@@ -6,3 +6,4 @@ test_cublas
 *.log
 playground
 ablation_test
+*.pyc
