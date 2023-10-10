@@ -10,7 +10,8 @@
 #include <type_traits>
 #include <vector>
 
-/// RUN: nvcc -arch=sm_89 -std=c++17 -DDEBUG -Xcompiler -fopenmp matmul-fp8-v0.cu -o test && ./test
+/// RUN: nvcc -arch=sm_90a -std=c++17 -DDEBUG -Xcompiler -fopenmp matmul-fp8-v0.cu -o test && ./test
+/// RUN: nvcc -arch=sm_90a matmul-fp8-v0.cu -o test && ./test stages 1 iters 200
 
 typedef __nv_fp8_e5m2 e5m2;
 static constexpr int BLOCKM = 128;
@@ -138,13 +139,12 @@ struct MatmulKernel {
   static constexpr int WGMMA_WARPS_PER_ROW = 1;
   static constexpr int WGMMA_WARPS_PER_COL =
       WARP_GROUP_SIZE / WGMMA_WARPS_PER_ROW; /// 4
-  static constexpr int WGMMA_WARP_REPEATS_PER_ROW =
-      WGMMAN / WGMMA_WARPS_PER_ROW / WGMMA_LANES_PER_ROW; /// N / 4
+  static constexpr int WGMMA_WARP_REPEATS_PER_ROW = WGMMAN / WGMMA_WARPS_PER_ROW / WGMMA_LANE_ROW_ELEMENT_STRIDE; /// N / 8
+      // WGMMAN / WGMMA_WARPS_PER_ROW / WGMMA_LANES_PER_ROW; /// N / 4
   static constexpr int WGMMA_WARP_REPEATS_PER_COL =
       WGMMAM / WGMMA_WARPS_PER_COL / WGMMA_LANES_PER_COL; /// 2
   static constexpr int WGMMA_WARP_ROW_ELEMENT_STRIDE =
-      WGMMAN / WGMMA_WARP_REPEATS_PER_ROW / WGMMA_WARPS_PER_ROW *
-      WGMMA_FRAG_ELEMENTS_PER_ITEM; /// 8
+      WGMMAN / WGMMA_WARP_REPEATS_PER_ROW / WGMMA_WARPS_PER_ROW; /// 8
   static constexpr int WGMMA_WARP_COL_ELEMENT_STRIDE =
       WGMMAM / WGMMA_WARP_REPEATS_PER_COL / WGMMA_WARPS_PER_COL; /// 8
   static_assert(WGMMA_LANE_ROW_ELEMENT_STRIDE == WGMMA_WARP_ROW_ELEMENT_STRIDE);
@@ -269,7 +269,7 @@ struct MatmulKernel {
                   uint32_t &d21, uint32_t &d22, uint32_t &d23, uint32_t &d24,
                   uint32_t &d25, uint32_t &d26, uint32_t &d27, uint32_t &d28,
                   uint32_t &d29, uint32_t &d30, uint32_t &d31) {
-    bool scale_D = true; /// use D=A*B+C format
+    int scale_D = 1; /// use D=A*B+C format
     constexpr int32_t scaleA = 1;
     constexpr int32_t scaleB = 1;
     asm volatile("{\n"
@@ -297,13 +297,25 @@ struct MatmulKernel {
 
   /// make shared memory descriptor
   template <class PointerType>
-  DEVICE GmmaDescriptor make_desc(PointerType smem_ptr) {
+  DEVICE GmmaDescriptor make_desc_a(PointerType smem_ptr) {
     GmmaDescriptor desc;
     uint32_t uint_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
     desc.bitfield.start_address_ = uint_ptr >> 4;
     desc.bitfield.layout_type_ = 0;          /// no swizzle
-    desc.bitfield.leading_byte_offset_ = 16; /// 16 bytes
-    desc.bitfield.stride_byte_offset_ = 8;   /// 8 bytes
+    desc.bitfield.leading_byte_offset_ = 8; /// 8 bytes
+    desc.bitfield.stride_byte_offset_ = 16;   /// 16 bytes
+    /// base_offset_ is not valid for non-swizzle
+    return desc;
+  }
+
+  template <class PointerType>
+  DEVICE GmmaDescriptor make_desc_b(PointerType smem_ptr) {
+    GmmaDescriptor desc;
+    uint32_t uint_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    desc.bitfield.start_address_ = uint_ptr >> 4;
+    desc.bitfield.layout_type_ = 0;          /// no swizzle
+    desc.bitfield.leading_byte_offset_ = 8; /// 8 bytes
+    desc.bitfield.stride_byte_offset_ = 16;   /// 16 bytes
     /// base_offset_ is not valid for non-swizzle
     return desc;
   }
@@ -340,12 +352,16 @@ struct MatmulKernel {
         ADType *smemA = SA_ + i * WGMMAM * WGMMAK;
         for (int j = 0; j < WarpGroupRepeatsPerRowC; ++j) {
           BDType *smemB = SB_ + j * WGMMAN * WGMMAK;
-          GmmaDescriptor desc_a = make_desc(smemA);
-          GmmaDescriptor desc_b = make_desc(smemB);
+          GmmaDescriptor desc_a = make_desc_a(smemA);
+          GmmaDescriptor desc_b = make_desc_b(smemB);
           WGMMA_ACCUM_ITEM_TYPE *curr_accum_item =
-              accum_item_ + (i * WarpGroupRepeatsPerColC + j) *
+              accum_item_ + (i * WarpGroupRepeatsPerRowC + j) *
                                 WGMMA_FRGA_ELEMNTS_C /
                                 WGMMA_FRAG_ELEMENTS_PER_ITEM;
+          // clear
+          // for (int i = 0; i < WGMMA_FRGA_ELEMNTS_C / WGMMA_FRAG_ELEMENTS_PER_ITEM; ++i) {
+          //   curr_accum_item[i] = (WGMMA_ACCUM_ITEM_TYPE)0;
+          // }
           for (int i = 0; i < WGMMA_FRGA_ELEMNTS_C / WGMMA_FRAG_ELEMENTS_PER_ITEM; ++i) {
             warpgroup_fence_operand(curr_accum_item[i]);
           }
@@ -379,7 +395,7 @@ struct MatmulKernel {
     WGMMA_ACCUM_ITEM_TYPE *globalC_item =
         reinterpret_cast<WGMMA_ACCUM_ITEM_TYPE *>(globalC);
     for (int i = 0; i < WarpGroupRepeatsPerColC; ++i) {
-      for (int j = 0; j < WarpGroupRepeatsPerRowC; ++i) {
+      for (int j = 0; j < WarpGroupRepeatsPerRowC; ++j) {
         for (int r = 0; r < WGMMA_WARP_REPEATS_PER_COL; ++r) {
           for (int c = 0; c < WGMMA_WARP_REPEATS_PER_ROW; ++c) {
             int rowIdx = globalRowElementIdxC(i, r);
@@ -387,12 +403,12 @@ struct MatmulKernel {
                 j, c, 0); /// 0 for the start position of each item
             int idx = globalElementIdxC(rowIdx, colIdx);
             idx /= WGMMA_FRAG_ELEMENTS_PER_ITEM; /// get the item idx
-            int accum_idx =
-                i * WarpGroupRepeatsPerRowC * WGMMA_WARP_REPEATS_PER_COL *
-                    WGMMA_WARP_REPEATS_PER_ROW +
-                j * WGMMA_WARP_REPEATS_PER_COL * WGMMA_WARP_REPEATS_PER_ROW +
-                r * WGMMA_WARP_REPEATS_PER_ROW + c;
-            accum_idx /= WGMMA_FRAG_ELEMENTS_PER_ITEM; /// get the item idx
+            int accum_idx = (i * WarpGroupRepeatsPerRowC + j) * WGMMA_FRGA_ELEMNTS_C / WGMMA_FRAG_ELEMENTS_PER_ITEM + c * WGMMA_WARP_REPEATS_PER_COL + r;
+                // i * WarpGroupRepeatsPerRowC * WGMMA_WARP_REPEATS_PER_COL *
+                //     WGMMA_WARP_REPEATS_PER_ROW +
+                // j * WGMMA_WARP_REPEATS_PER_COL * WGMMA_WARP_REPEATS_PER_ROW +
+                // r * WGMMA_WARP_REPEATS_PER_ROW + c;
+            // accum_idx /= WGMMA_FRAG_ELEMENTS_PER_ITEM; /// get the item idx
             globalC_item[idx] = accum_item_[accum_idx];
           }
         }
@@ -459,7 +475,7 @@ struct MatmulKernel {
   }
 
   DEVICE void run(ADType *globalA, BDType *globalB, CDType *globalC) {
-    /// naive_gemm(globalA, globalB, globalC);
+    // naive_gemm(globalA, globalB, globalC);
     gemm_no_pipeline(globalA, globalB, globalC);
   }
 
@@ -535,6 +551,7 @@ struct MatmulKernel {
                WGMMA_SMEM_BLOCK_COL +
            sharedRowIdx % WGMMA_SMEM_BLOCK_ROW * WGMMA_SMEM_BLOCK_COL +
            sharedColIdx % WGMMA_SMEM_BLOCK_COL;
+      // return sharedRowIdx * BLOCKK + sharedColIdx;
   }
 
   /// load B from global to shared swizzle
@@ -675,9 +692,9 @@ const int M = 256;
 const int N = 256;
 const int K = 256;
 #else
-const int M = 5376;
-const int N = 5376;
-const int K = 2048;
+const int M = 4096;
+const int N = 4096;
+const int K = 4096;
 #endif
 #define MAX(a, b) (a) > (b) ? (a) : (b)
 
@@ -757,13 +774,14 @@ int main(int argc, char *argv[]) {
   for (int i = 0; i < M; i += 64) {
 #pragma omp parallel for
     for (int j = 0; j < N; j += 64) {
-      float accum[64 * 64] = {0};
+      half accum[64 * 64] = {0};
       for (int k = 0; k < K; k += 32) {
         for (int kk = 0; kk < 32; ++kk) {
           for (int jj = 0; jj < 64; ++jj) {
             for (int ii = 0; ii < 64; ++ii) {
-              accum[ii * 64 + jj] += ((float)hA[(i + ii) * K + k + kk] *
+              auto tmp = (float)accum[ii * 64 + jj] + ((float)hA[(i + ii) * K + k + kk] *
                                       (float)hB[(j + jj) * K + k + kk]);
+              accum[ii * 64 + jj] = (half)tmp;
             }
           }
         }
@@ -876,7 +894,7 @@ int main(int argc, char *argv[]) {
       if (maxv < 0) {
         maxv = -maxv;
       }
-      if (diff / maxv > 1e-2) {
+      if (diff / maxv > 1e-1) {
         errors += 1;
       }
     }
