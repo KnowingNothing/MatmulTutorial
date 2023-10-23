@@ -83,7 +83,7 @@ struct Options {
   int iterations;
 
   Options()
-      : help(false), problem_size({5376, 5376, 2048}), batch_count(1),
+      : help(false), problem_size({5120, 4096, 4096}), batch_count(1),
         reference_check(true), iterations(200), alpha(1), beta() {}
 
   bool valid() { return true; }
