@@ -1,6 +1,7 @@
 #include "barrier.h"
 #include "common.h"
 #include "reference.h"
+#include "pipeline.h"
 
 const int testM = 4096;
 const int testN = 4096;
@@ -8,8 +9,21 @@ const int testK = 4096;
 const int iters = 100;
 
 /// RUN:
-/// nvcc -arch=sm_90a -lcuda -std=c++17 matmul-pingpong-v1.cu -o test && ./test
+/// nvcc -arch=sm_90a -I ../../../include -lcuda -std=c++17 matmul-pingpong-v1.cu -o test && ./test
 /// |& tee trace.log
+
+
+struct BlockMma {
+  __device__ void load() {
+    int warp_idx = threadIdx.x / WARP_SIZE;
+    int warp_idx_in_warp_group = warp_idx % (WARP_GROUP_SIZE / WARP_SIZE);
+    int lane_predicate = elect_one_sync();
+
+    if (warp_idx_in_warp_group == 0 && lane_predicate) {
+      
+    }
+  }
+};
 
 using MmaBarrier = OrderedSequenceBarrier<2, 2>;
 using LoadBarrier = OrderedSequenceBarrier<1, 2>;
