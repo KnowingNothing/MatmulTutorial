@@ -269,6 +269,15 @@ void random_fill(DType* tensor, std::vector<int> shape) {
 }
 
 template <class DType>
+void constant_fill(DType* tensor, std::vector<int> shape, DType value) {
+  int length =
+      std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<int>());
+  for (int i = 0; i < length; ++i) {
+    tensor[i] = value;
+  }
+}
+
+template <class DType>
 DType* alloc_gpu_tensor(std::vector<int> shape) {
   DType* dt;
   CUDA_CHECK(cudaMalloc(
@@ -298,12 +307,32 @@ void copy_to_gpu(DType* hptr, DType* dptr, std::vector<int> shape) {
 }
 
 template <class DType>
+void copy_to_gpu_async(DType* hptr, DType* dptr, std::vector<int> shape,
+                       cudaStream_t stream = 0) {
+  CUDA_CHECK(cudaMemcpyAsync(
+      dptr, hptr,
+      std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<int>()) *
+          sizeof(DType),
+      cudaMemcpyHostToDevice, stream));
+}
+
+template <class DType>
 void copy_to_cpu(DType* hptr, DType* dptr, std::vector<int> shape) {
   CUDA_CHECK(cudaMemcpy(
       hptr, dptr,
       std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<int>()) *
           sizeof(DType),
       cudaMemcpyDeviceToHost));
+}
+
+template <class DType>
+void copy_to_cpu_async(DType* hptr, DType* dptr, std::vector<int> shape,
+                       cudaStream_t stream = 0) {
+  CUDA_CHECK(cudaMemcpyAsync(
+      hptr, dptr,
+      std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<int>()) *
+          sizeof(DType),
+      cudaMemcpyDeviceToHost, stream));
 }
 
 template <class DType>
