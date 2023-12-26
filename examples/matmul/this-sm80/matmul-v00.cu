@@ -43,7 +43,7 @@ __device__ void loadSmemB(half *smem, half *B, int N, int K, int ko)
     int ty = threadIdx.y;
     int tz = threadIdx.z;
     int tid = tz * 64 + ty * 32 + tx;
-    for (int i = 0; i < 64; ++i)
+    for (int i = 0; i < 32; ++i)
     {
         int row = i * 4 + tid / 32;
         int col = tid % 32;
