@@ -1,12 +1,12 @@
 #include "common.h"
-// copy async
+// stream + split copy async
 
 // nvcc -arch=sm_90a -std=c++17 -I ../../include/ -lcuda ldgmem_ldsmem_v0.cu -o test
 
 const int SM_LODA_BYTES = 128/8;
 
 template <typename DType, int BLOCKM, int BLOCKN, int NUM_THREADS>
-__global__ void naive_matrix_ldsm(DType* source, int M, int N, DType* dummy_out) {
+__global__ void split_matrix_ldsm(DType* source, int M, int N, DType* dummy_out, int split, int curr_split) {
     __shared__ DType smem[BLOCKM*BLOCKN];
     const int VEC_LEN = SM_LODA_BYTES / sizeof(DType);
     const int VEC_REPEAT = BLOCKN / VEC_LEN;
@@ -16,6 +16,8 @@ __global__ void naive_matrix_ldsm(DType* source, int M, int N, DType* dummy_out)
     static_assert(BLOCKN % VEC_LEN == 0);
     static_assert(NUM_THREADS % THREAD_N == 0);
     static_assert(ROW_REPEAT * THREAD_M == BLOCKM);
+
+    dummy_out += M / split * curr_split * N;
 
     int mo = blockIdx.x * BLOCKM;
     int mi = threadIdx.x / THREAD_N;
@@ -63,30 +65,44 @@ void cpu_dummy(DType* source, DType* dummy_out, int M, int N) {
 int main(int argc, char** argv) {
     const int M = 1024;
     const int N = 1024;
+    int split = 4;
     using DType = half;
     const int BLOCKM = 128;
     const int BLOCKN = 128;
     const int NUM_THREADS = 128;
     std::vector<int> shape{M, N};
+    std::vector<int> epoch_shape{M/split, N};
     auto A = alloc_cpu_tensor<DType>(shape);
     random_fill(A, shape);
+    // constant_fill(A, shape, DType(1));
     auto B = alloc_cpu_tensor<DType>(shape);
     auto golden = alloc_cpu_tensor<DType>(shape);
 
     GPUTimer gpu_timer;
+    cudaStream_t s1, s2;
+    cudaStreamCreate(&s1);
+    cudaStreamCreate(&s2);
+    std::vector<cudaStream_t*> streams{&s1, &s2};
 
-    auto dA = alloc_gpu_tensor<DType>(shape);
+    std::vector<DType*> dAs;
+    for (int i = 0; i < split; ++i) {
+        dAs.push_back(alloc_gpu_tensor<DType>(epoch_shape));
+    }
     auto dB = alloc_gpu_tensor<DType>(shape);
+    
     dim3 block(NUM_THREADS);
-    dim3 grid(ceil_div(M, BLOCKM));
+    dim3 grid(ceil_div(M/split, BLOCKM));
     gpu_timer.sync_all();
     gpu_timer.tick();
-    copy_to_gpu_async(A, dA, shape);
-    naive_matrix_ldsm<DType, BLOCKM, BLOCKN, NUM_THREADS><<<grid, block>>>(dA, M, N, dB);
+    for (int i = 0; i < split; ++i) {
+        copy_to_gpu_async(A + M/split * i * N, dAs[i], epoch_shape, *streams[i%2]);
+        split_matrix_ldsm<DType, BLOCKM, BLOCKN, NUM_THREADS><<<grid, block, 0, *streams[i%2]>>>(dAs[i], M, N, dB, split, i);
+    }
     gpu_timer.tick();
     gpu_timer.sync_all();
+    std::cout << "GPU split done! Use " << gpu_timer.report_last_ms() << " ms.\n";
     copy_to_cpu_async(B, dB, shape);
-    std::cout << "GPU naive done! Use " << gpu_timer.report_last_ms() << " ms.\n";
+    
 
     std::cout << "Calculating golden...\n";
     cpu_dummy(A, golden, M, N);

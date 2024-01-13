@@ -110,7 +110,7 @@ class PipelineTmaAsync {
     // Goal : To divide SYNCS Empty Arrival duty equally amongst the Warp-Group
     // (128 threads)
     dim3 block_id = block_id_in_cluster();
-    auto cluster_size = ClusterX_ * ClusterY_ * ClusterZ_;
+    static constexpr int cluster_size = ClusterX_ * ClusterY_ * ClusterZ_;
     static_assert(cluster_size <= MAX_CLUSTER_SIZE,
                   "ERROR : Cluster size too large !");
 

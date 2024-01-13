@@ -17,6 +17,8 @@ struct KernelSharedStorage {
 
 };
 
+const int WG_NUMBER = 3;
+
 struct KernelParams {
     int M;
     int N;

@@ -35,15 +35,17 @@ __global__ void split_matrix_ldsm(DType* source, int M, int N, DType* dummy_out,
             ld_smem[sm_idx / VEC_LEN] = ld_source[idx / VEC_LEN];
         }
         __syncthreads();
-        for (int row_repeat = 0; row_repeat < ROW_REPEAT; ++row_repeat) {
-            int m = mo + row_repeat * THREAD_M + mi;
-            int n = no + ni * VEC_LEN;
-            int idx = m * N + n;
-            int sm = row_repeat * THREAD_M + mi;
-            int sn = ni * VEC_LEN;
-            int sm_idx = sm * BLOCKN + sn;
-            for (int i = 0; i < VEC_LEN; ++i) {
-                dummy_out[idx + i] = smem[sm_idx + i] + DType(1);
+        for (int x = 0; x < 256; ++x) {
+            for (int row_repeat = 0; row_repeat < ROW_REPEAT; ++row_repeat) {
+                int m = mo + row_repeat * THREAD_M + mi;
+                int n = no + ni * VEC_LEN;
+                int idx = m * N + n;
+                int sm = row_repeat * THREAD_M + mi;
+                int sn = ni * VEC_LEN;
+                int sm_idx = sm * BLOCKN + sn;
+                for (int i = 0; i < VEC_LEN; ++i) {
+                    dummy_out[idx + i] = smem[sm_idx + i] + DType(1);
+                }
             }
         }
     }

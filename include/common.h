@@ -6,6 +6,7 @@
  **************************************************************************************************/
 #pragma once
 
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -22,6 +23,8 @@
 #include <utility>
 #include <vector>
 
+using half_t = half;
+
 #define CUDA_CHECK(status)                                              \
   {                                                                     \
     cudaError_t error = status;                                         \
@@ -36,13 +39,10 @@
 #define HOST_DEVICE __forceinline__ __host__ __device__
 #define DEVICE __forceinline__ __device__
 
-static constexpr int SM_NUMBER = 144;
+static constexpr int SM_NUMBER = 114;
 static constexpr int MAX_CLUSTER_SIZE = 16;
 static constexpr int WARP_GROUP_SIZE = 128;
-static constexpr int WG_NUMBER = 3;
 static constexpr int WARP_SIZE = 32;
-static constexpr int CLUSTER_M = 2;
-static constexpr int CLUSTER_N = 1;
 
 #define REQUIRES(...) typename std::enable_if<(__VA_ARGS__)>::type* = nullptr
 
@@ -269,6 +269,15 @@ void random_fill(DType* tensor, std::vector<int> shape) {
 }
 
 template <class DType>
+void arange_fill(DType* tensor, std::vector<int> shape, int bound = 1024) {
+  int length =
+      std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<int>());
+  for (int i = 0; i < length; ++i) {
+    tensor[i] = (DType)((i % bound));
+  }
+}
+
+template <class DType>
 void constant_fill(DType* tensor, std::vector<int> shape, DType value) {
   int length =
       std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<int>());
@@ -409,6 +418,14 @@ DEVICE dim3 block_id_in_cluster() {
   asm volatile("mov.u32 %0, %cluster_ctaid.y;\n" : "=r"(y) :);
   asm volatile("mov.u32 %0, %cluster_ctaid.z;\n" : "=r"(z) :);
   return {x, y, z};
+}
+
+// Returns the warp id in block
+DEVICE int warp_id_in_block() { return threadIdx.x / WARP_SIZE; }
+
+// Returns the warp id in warp group
+DEVICE int warp_id_in_warp_group() {
+  return warp_id_in_block() % (WARP_GROUP_SIZE / WARP_SIZE);
 }
 
 // A generic Swizzle functor

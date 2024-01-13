@@ -10,9 +10,9 @@ struct TileScheduler {
     int total_problem_mn;
 
     struct Params {
-        const int M;
-        const int N;
-        const int K;
+        int M;
+        int N;
+        int K;
     };
 
     struct TileInfo {
