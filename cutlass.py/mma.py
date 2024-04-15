@@ -8,6 +8,7 @@ class GmmaMajor(Enum):
     MajorMN = 0
     MajorK = 1
 
+
 @dataclass
 class GmmaDescriptor:
     start_address_14_bits: int = 0
@@ -28,6 +29,11 @@ class GmmaDescriptorIterator:
 
 
 @dataclass
+class SmemDesc(GmmaDescriptorIterator):
+    gmma_major: GmmaMajor = GmmaMajor.MajorMN
+
+
+@dataclass
 class MMA_OP:
     M_tile: int = 0
     N_tile: int = 0
@@ -40,8 +46,10 @@ class MMA_OP:
     A_scale: int = 1
     B_scale: int = 1
 
+
 class UniversalFMA(MMA_OP):
     pass
+
 
 class SM90_SS(MMA_OP):
     pass
@@ -55,43 +63,56 @@ class MMA_Traits:
         self.B_dtype = mma_op.B_dtype
         self.C_dtype = mma_op.Accum_dtype
 
-        self.A_frag_type = 
+        A_major = GmmaMajor.MajorK if not mma_op.A_transpose else GmmaMajor.MajorMN
+        B_major = GmmaMajor.MajorK if not mma_op.B_transpose else GmmaMajor.MajorMN
+        self.A_frag_type = SmemDesc(A_major)
+        self.B_frag_type = SmemDesc(B_major)
+        
+        self.MNK_shape = HyperCube(3, [mma_op.M_tile, mma_op.N_tile, mma_op.K_tile])
+        self.
+
 
 def gmma_selector(
-        A_dtype: DType,
-        B_dtype: DType,
-        C_dtype: DType,
-        MNK_tiling: HyperCube,
-        A_major: GmmaMajor,
-        B_major: GmmaMajor
-    ):
+    A_dtype: DType,
+    B_dtype: DType,
+    C_dtype: DType,
+    MNK_tiling: HyperCube,
+    A_major: GmmaMajor,
+    B_major: GmmaMajor,
+):
     assert MNK_tiling.ndim == 3
     M_tile = MNK_tiling[0]
     N_tile = MNK_tiling[1]
     K_tile = MNK_tiling[2]
-    assert not MNK_tiling.has_dynamic(), "Tiling info shouldn't has dynamic at GMMA level."
+    assert (
+        not MNK_tiling.has_dynamic()
+    ), "Tiling info shouldn't have dynamic at GMMA level."
     assert M_tile % 64 == 0, "GMMA tiling M dimension should be multiple of 64."
     A_transpose = False if A_major == GmmaMajor.MajorK else True
     B_transpose = False if B_major == GmmaMajor.MajorK else True
 
     # FP32 accumulator
-    if (C_dtype.is_same(float_t())):
+    if C_dtype.is_same(float_t()):
         # FP16 inputs
-        if (A_dtype.is_same(half_t())):
+        if A_dtype.is_same(half_t()):
             assert A_dtype.is_same(B_dtype), "A and B should have the same dtype."
             assert K_tile % 16 == 0, "GMMA tiling K dimension should be multiple of 16."
             assert N_tile % 8 == 0, "GMMA tiling N dimension should be multiple of 8."
             switch_table = [
-                (k, SM90_SS(
-                    M_tile=64,
-                    N_tile=k,
-                    K_tile=16,
-                    A_dtype=half_t(),
-                    B_dtype=half_t(),
-                    Accum_dtype=float_t(),
-                    A_transpose=A_transpose,
-                    B_transpose=B_transpose
-                )) for k in [256, 192, 128, 96, 64, 32, 16, 8]
+                (
+                    k,
+                    SM90_SS(
+                        M_tile=64,
+                        N_tile=k,
+                        K_tile=16,
+                        A_dtype=half_t(),
+                        B_dtype=half_t(),
+                        Accum_dtype=float_t(),
+                        A_transpose=A_transpose,
+                        B_transpose=B_transpose,
+                    ),
+                )
+                for k in [256, 192, 128, 96, 64, 32, 16, 8]
             ]
             for k, v in switch_table:
                 if N_tile % k == 0:
@@ -101,4 +122,3 @@ def gmma_selector(
         f"A_dtype: {A_dtype}, B_dtype: {B_dtype}, C_dtype: {C_dtype}\n"
         f"MNK_tiling: {MNK_tiling}, A_major: {A_major}, B_major: {B_major}\n"
     )
-
