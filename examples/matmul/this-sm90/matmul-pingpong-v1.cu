@@ -1,10 +1,5 @@
-#include "barrier.h"
 #include "common.h"
-#include "descriptor.h"
-#include "pipeline.h"
 #include "reference.h"
-#include "scheduler.h"
-#include "tma.h"
 
 const int testM = 4096;
 const int testN = 4096;
@@ -17,362 +12,1188 @@ static constexpr int BLOCKM = 128;
 static constexpr int BLOCKN = 128;
 static constexpr int BLOCKK = 64;
 static constexpr int STAGES = 7;
+#define DEBUG 1
+#ifdef DEBUG
+#define PRINT_BT(BX, BY, TX, ...)                                    \
+  {                                                                  \
+    if (blockIdx.x == BX && blockIdx.y == BY && threadIdx.x == TX) { \
+      printf(__VA_ARGS__);                                           \
+    }                                                                \
+  }
+#else
+#define PRINT_BT(BX, BY, TX, ...)
+#endif
+#ifdef DEBUG
+#define PRINT_B(BX, BY, ...)                    \
+  {                                             \
+    if (blockIdx.x == BX && blockIdx.y == BY) { \
+      printf(__VA_ARGS__);                      \
+    }                                           \
+  }
+#else
+#define PRINT_B(BX, BY, ...)
+#endif
 
 /// RUN:
 /// nvcc -arch=sm_90a -I ../../../include -lcuda -std=c++17
 /// matmul-pingpong-v1.cu -o test && ./test
 /// |& tee trace.log
 
-enum class Major : uint8_t {
-  MajorK,
-  MajorMN,
-};
+namespace utils {
 
-enum class ScaleOut {
-  Zero = 0,
-  One = 1,
-};
+using TmaDescriptor = CUtensorMap;
 
-template <class Pipeline>
-DEVICE PipelineState<Pipeline::Stages> make_producer_start_state() {
-  // Producer starts with an opposite phase as the buffers are initially empty
-  constexpr int InitialProducerStage = 0;
-  constexpr uint32_t InitialProducerPhase = 1;
-  constexpr uint32_t InitialProducerCount = 0;
-  return {InitialProducerStage, InitialProducerPhase, InitialProducerCount};
+template <class T>
+inline CUtensorMapDataType to_CUtensorMapDataType() {
+  if constexpr (std::is_same<T, int8_t>::value) {
+    return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+  } else if constexpr (std::is_same<T, uint8_t>::value) {
+    return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+  } else
+    //   if constexpr (std::is_same<T, float_e4m3_t>::value) { return
+    //   CU_TENSOR_MAP_DATA_TYPE_UINT8;    } else if constexpr (std::is_same<T,
+    //   float_e5m2_t>::value) { return CU_TENSOR_MAP_DATA_TYPE_UINT8;    } else
+    if constexpr (std::is_same<T, uint16_t>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_UINT16;
+    } else if constexpr (std::is_same<T, uint32_t>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_UINT32;
+    } else if constexpr (std::is_same<T, uint64_t>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_UINT64;
+    } else if constexpr (std::is_same<T, int32_t>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_INT32;
+    } else if constexpr (std::is_same<T, int64_t>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_INT64;
+    } else if constexpr (std::is_same<T, half_t>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    } else if constexpr (std::is_same<T, float>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    } else if constexpr (std::is_same<T, double>::value) {
+      return CU_TENSOR_MAP_DATA_TYPE_FLOAT64;
+    } else
+    //   if constexpr (std::is_same<T,   bfloat16_t>::value) { return
+    //   CU_TENSOR_MAP_DATA_TYPE_BFLOAT16; } else if constexpr (std::is_same<T,
+    //   tfloat32_t>::value) { return CU_TENSOR_MAP_DATA_TYPE_TFLOAT32; } else
+    {
+      static_assert(sizeof(T) < 0, "Unknown TMA Format!");
+    }
 }
 
-template<uint32_t RegCount>
-DEVICE
-void warpgroup_reg_dealloc(){
-  asm volatile( "setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount) );
+enum class SmemSwizzleBits : uint8_t {
+  DISABLE = 0,
+  B32 = 1,
+  B64 = 2,
+  B128 = 3,
+};
+
+template <int B, int M, int S>
+HOST_DEVICE constexpr SmemSwizzleBits get_tma_swizzle_bits(Swizzle<B, M, S>) {
+  if constexpr (M == 4) {
+    switch (B) {
+      default:
+        static_assert(0 <= B && B <= 3,
+                      "Expected B = 0,1,2, or 3 when M == 4. Unsupported "
+                      "layout swizzle.");
+      case 3:
+        return SmemSwizzleBits::B128;
+      case 2:
+        return SmemSwizzleBits::B64;
+      case 1:
+        return SmemSwizzleBits::B32;
+      case 0:
+        return SmemSwizzleBits::DISABLE;
+    }
+  } else {
+    static_assert(M < 0, "Unsupported layout swizzle.");
+  }
 }
 
-/*====================*/
-/*=== WgMma  ====*/
-struct WgMma {
-  using DType = float;
-  using AType = half_t;
-  using BType = half_t;
-  using CType = float;
+inline CUtensorMapSwizzle to_CUtensorMapSwizzle(SmemSwizzleBits const& t) {
+  switch (t) {
+    default:
+      assert(false && "Unknown SmemSwizzleBits!");
+    case SmemSwizzleBits::DISABLE:
+      return CU_TENSOR_MAP_SWIZZLE_NONE;
+    case SmemSwizzleBits::B32:
+      return CU_TENSOR_MAP_SWIZZLE_32B;
+    case SmemSwizzleBits::B64:
+      return CU_TENSOR_MAP_SWIZZLE_64B;
+    case SmemSwizzleBits::B128:
+      return CU_TENSOR_MAP_SWIZZLE_128B;
+  }
+}
 
-  using AFrag = GmmaDescriptor;
-  using BFrag = GmmaDescriptor;
+/// In this function, minor dimension moves faster than major dimension
+template <int BlockMajorSize, int BlockMinorSize, int TmaDim, typename DType,
+          int B, int M, int S>
+TmaDescriptor make_tma_copy_desc(DType* gmem_ptr, int shape_major,
+                                 int shape_minor,
+                                 Swizzle<B, M, S> const& swizzle,
+                                 uint32_t num_multicast) {
+  void* gmem_address = (void*)gmem_ptr;
+  uint64_t gmem_prob_shape[5] = {(uint64_t)shape_minor, (uint64_t)shape_major,
+                                 1, 1, 1};
+  uint64_t gmem_prob_stride[5] = {sizeof(DType), sizeof(DType) * shape_minor, 0,
+                                  0, 0};
 
-  static constexpr int ShapeM = 64;
-  static constexpr int ShapeN = 128;
-  static constexpr int ShapeK = 16;
-  static constexpr int NumThread = 128;
+  assert((reinterpret_cast<uint64_t>(gmem_address) & 0b1111) == 0);
+  assert(gmem_prob_shape[0] >= (uint64_t(1)));
+  assert(gmem_prob_shape[0] <= (uint64_t(1) << 32));
+  assert(gmem_prob_shape[1] >= (uint64_t(1)));
+  assert(gmem_prob_shape[1] <= (uint64_t(1) << 32));
+  assert(gmem_prob_shape[2] >= (uint64_t(1)));
+  assert(gmem_prob_shape[2] <= (uint64_t(1) << 32));
+  assert(gmem_prob_shape[3] >= (uint64_t(1)));
+  assert(gmem_prob_shape[3] <= (uint64_t(1) << 32));
+  assert(gmem_prob_shape[4] >= (uint64_t(1)));
+  assert(gmem_prob_shape[4] <= (uint64_t(1) << 32));
 
-  ScaleOut accumulate_ = ScaleOut::One;
+  assert(gmem_prob_stride[0] == sizeof(DType));
+  assert(gmem_prob_stride[1] < (uint64_t(1) << 40));
+  assert((gmem_prob_stride[1] & 0b1111) == 0);
+  assert(gmem_prob_stride[2] < (uint64_t(1) << 40));
+  assert((gmem_prob_stride[2] & 0b1111) == 0);
+  assert(gmem_prob_stride[3] < (uint64_t(1) << 40));
+  assert((gmem_prob_stride[3] & 0b1111) == 0);
+  assert(gmem_prob_stride[4] < (uint64_t(1) << 40));
+  assert((gmem_prob_stride[4] & 0b1111) == 0);
 
-  /*
-    tid_in_group : threadIdx.x % 128
-    row_repeat_id : [0, 1]
-    col_major_repeat_id : [0, ShapeN / 8 - 1]
-    col_minor_repeat_id : [0, 1]
-  */
-  static int make_C_offset(int tid_in_group, int row_repeat_id,
-                           int col_major_repeat_id, int col_minor_repeat_id) {
-    static constexpr int row_repeat_number = 2;
-    static constexpr int col_major_repeat_number = ShapeN / 8;
-    static constexpr int col_minor_repeat_number = 2;
+  assert(BlockMajorSize % num_multicast == 0);
+  uint32_t smem_box_shape[5] = {uint32_t(BlockMinorSize),
+                                uint32_t(BlockMajorSize / num_multicast), 1, 1,
+                                1};
+  uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
-    static constexpr int col_minor_stride = 1;
-    static constexpr int col_major_stride = 8;
-    static constexpr int threads_per_row_in_warp = 8;
-    static constexpr int threads_per_col_in_warp =
-        WARP_SIZE / threads_per_row_in_warp;
+  assert(smem_box_shape[0] >= (uint32_t(1)));  // Size must be min 1
+  assert(smem_box_shape[0] <=
+         (uint32_t(1) << 8));                  // Size must be max 2^8 = 256
+  assert(smem_box_shape[1] >= (uint32_t(1)));  // Size must be min 1
+  assert(smem_box_shape[1] <=
+         (uint32_t(1) << 8));                  // Size must be max 2^8 = 256
+  assert(smem_box_shape[2] >= (uint32_t(1)));  // Size must be min 1
+  assert(smem_box_shape[2] <=
+         (uint32_t(1) << 8));                  // Size must be max 2^8 = 256
+  assert(smem_box_shape[3] >= (uint32_t(1)));  // Size must be min 1
+  assert(smem_box_shape[3] <=
+         (uint32_t(1) << 8));                  // Size must be max 2^8 = 256
+  assert(smem_box_shape[4] >= (uint32_t(1)));  // Size must be min 1
+  assert(smem_box_shape[4] <=
+         (uint32_t(1) << 8));  // Size must be max 2^8 = 256
 
-    static constexpr int row_repeat_warp_stride =
-        ShapeN * threads_per_row_in_warp;
-    static constexpr int row_group_stride =
-        row_repeat_warp_stride * row_repeat_number;
-    static constexpr int row_warp_stride = ShapeN;
-    static constexpr int col_warp_stride = col_minor_repeat_number;
+  assert(smem_box_stride[0] >= (uint32_t(1)));  // Stride must be min 1
+  assert(smem_box_stride[0] <= (uint32_t(8)));  // Stride must be max 2^3 = 8
+  assert(smem_box_stride[1] >= (uint32_t(1)));  // Stride must be min 1
+  assert(smem_box_stride[1] <= (uint32_t(8)));  // Stride must be max 2^3 = 8
+  assert(smem_box_stride[2] >= (uint32_t(1)));  // Stride must be min 1
+  assert(smem_box_stride[2] <= (uint32_t(8)));  // Stride must be max 2^3 = 8
+  assert(smem_box_stride[3] >= (uint32_t(1)));  // Stride must be min 1
+  assert(smem_box_stride[3] <= (uint32_t(8)));  // Stride must be max 2^3 = 8
+  assert(smem_box_stride[4] >= (uint32_t(1)));  // Stride must be min 1
+  assert(smem_box_stride[4] <= (uint32_t(8)));  // Stride must be max 2^3 = 8
 
-    int row_id_in_group = tid_in_group / WARP_SIZE;
-    int tid_in_warp = tid_in_group % WARP_SIZE;
-    int row_id_in_warp = tid_in_warp / threads_per_col_in_warp;
-    int col_id_in_warp = tid_in_warp % threads_per_col_in_warp;
-    return (row_id_in_group * row_group_stride +
-            row_repeat_id * row_repeat_warp_stride +
-            row_id_in_warp * row_warp_stride +
-            col_major_repeat_id * col_major_stride +
-            col_id_in_warp * col_warp_stride +
-            col_minor_repeat_id * col_minor_stride);
+  TmaDescriptor tma_desc = {0};
+
+  CUtensorMapDataType tma_format =
+      to_CUtensorMapDataType<typename std::remove_cv<DType>::type>();
+  CUtensorMapInterleave tma_interleave = CU_TENSOR_MAP_INTERLEAVE_NONE;
+  CUtensorMapL2promotion tma_l2Promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+  CUtensorMapFloatOOBfill tma_oobFill = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+
+  CUtensorMapSwizzle smem_swizzle =
+      to_CUtensorMapSwizzle(get_tma_swizzle_bits(swizzle));
+  CUresult result = cuTensorMapEncodeTiled(
+      &tma_desc, tma_format, TmaDim, gmem_address, gmem_prob_shape,
+      gmem_prob_stride + 1, smem_box_shape, smem_box_stride, tma_interleave,
+      smem_swizzle, tma_l2Promotion, tma_oobFill);
+
+  if (result != CUDA_SUCCESS) {
+    std::cerr << "TMA Desc Addr:   " << &tma_desc << "\nformat         "
+              << tma_format << "\ndim            " << TmaDim
+              << "\ngmem_address   " << gmem_address << "\nglobalDim      "
+              << gmem_prob_shape << "\nglobalStrides  " << gmem_prob_stride
+              << "\nboxDim         " << smem_box_shape << "\nelementStrides "
+              << smem_box_stride << "\ninterleave     " << tma_interleave
+              << "\nswizzle        " << smem_swizzle << "\nl2Promotion    "
+              << tma_l2Promotion << "\noobFill        " << tma_oobFill
+              << std::endl;
+    std::cerr << "Error: Failed to initialize the TMA descriptor " << result
+              << std::endl;
+    assert(false);
+  }
+
+  return tma_desc;
+}
+
+HOST_DEVICE
+void prefetch_tma_descriptor(TmaDescriptor const* desc_ptr) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  // Prefetch TMA Descriptor using generic addressing (i.e. no specific state
+  // space: const or param)
+  asm volatile("prefetch.tensormap [%0];" : : "l"(gmem_int_desc) : "memory");
+}
+
+DEVICE void fence_barrier_init() {
+  asm volatile(
+      "{\n\t"
+      "fence.mbarrier_init.release.cluster; \n"
+      "}" ::);
+}
+
+DEVICE void cluster_arrive_relaxed() {
+  asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" : :);
+}
+
+DEVICE void cluster_wait() {
+  asm volatile("barrier.cluster.wait.aligned;\n" : :);
+}
+
+template <uint32_t RegCount>
+DEVICE void warpgroup_reg_alloc() {
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+template <uint32_t RegCount>
+DEVICE void warpgroup_reg_dealloc() {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegCount));
+}
+
+DEVICE void tma_copy_2d(TmaDescriptor const* const desc_ptr,
+                        uint64_t& smem_mbar, void const* const smem_ptr,
+                        int32_t const& crd0, int32_t const& crd1) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  uint32_t smem_int_mbar = cast_smem_ptr_to_uint(&smem_mbar);
+  uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::"
+      "bytes"
+      " [%0], [%1, {%3, %4}], [%2];"
+      :
+      : "r"(smem_int_ptr), "l"(gmem_int_desc), "r"(smem_int_mbar), "r"(crd0),
+        "r"(crd1)
+      : "memory");
+}
+
+DEVICE void tma_copy_2d_multicast(TmaDescriptor const* const desc_ptr,
+                                  uint64_t& smem_mbar, uint16_t multicast_mask,
+                                  void const* const smem_ptr,
+                                  int32_t const& crd0, int32_t const& crd1) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  uint32_t smem_int_mbar = cast_smem_ptr_to_uint(&smem_mbar);
+  uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::"
+      "bytes.multicast::cluster"
+      " [%0], [%1, {%4, %5}], [%2], %3;"
+      :
+      : "r"(smem_int_ptr), "l"(gmem_int_desc), "r"(smem_int_mbar),
+        "h"(multicast_mask), "r"(crd0), "r"(crd1)
+      : "memory");
+}
+
+DEVICE void tma_copy_3d(TmaDescriptor const* const desc_ptr,
+                        uint64_t& smem_mbar, void const* const smem_ptr,
+                        int32_t const& crd0, int32_t const& crd1,
+                        int32_t const& crd2) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  uint32_t smem_int_mbar = cast_smem_ptr_to_uint(&smem_mbar);
+  uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::"
+      "bytes"
+      " [%0], [%1, {%3, %4, %5}], [%2];"
+      :
+      : "r"(smem_int_ptr), "l"(gmem_int_desc), "r"(smem_int_mbar), "r"(crd0),
+        "r"(crd1), "r"(crd2)
+      : "memory");
+}
+
+DEVICE void tma_copy_3d_multicast(TmaDescriptor const* const desc_ptr,
+                                  uint64_t& smem_mbar, uint16_t multicast_mask,
+                                  void const* const smem_ptr,
+                                  int32_t const& crd0, int32_t const& crd1,
+                                  int32_t const& crd2) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  uint32_t smem_int_mbar = cast_smem_ptr_to_uint(&smem_mbar);
+  uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::"
+      "bytes.multicast::cluster"
+      " [%0], [%1, {%4, %5, %6}], [%2], %3;"
+      :
+      : "r"(smem_int_ptr), "l"(gmem_int_desc), "r"(smem_int_mbar),
+        "h"(multicast_mask), "r"(crd0), "r"(crd1), "r"(crd2)
+      : "memory");
+}
+
+template <typename T>
+DEVICE void cp_async(void* ptr, const T* gmem_ptr) {
+  uint32_t smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+
+  asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(
+                   smem_ptr),
+               "l"(gmem_ptr), "n"(16), "r"(16));
+}
+
+}  // namespace utils
+
+// Cluster-wide barrier. CUDA barrier doesn't support cluster scope. Have to
+// follow CUTLASS. CUDA doesn't support barrier because cluster-wide barrier
+// arrive can't return phase token. So CUTLASS doesn't use phase token as return
+// value. But wait still need the phase token.
+struct Barrier {
+  uint64_t barrier_;
+  DEVICE Barrier() = delete;
+
+  DEVICE void init(uint32_t arrive_count) const {
+    uint64_t const* smem_ptr = &barrier_;
+    uint32_t smem_addr = cast_smem_ptr_to_uint(smem_ptr);
+    asm volatile(
+        "{\n\t"
+        "mbarrier.init.shared.b64 [%1], %0; \n"
+        "}"
+        :
+        : "r"(arrive_count), "r"(smem_addr));
+  }
+
+  // local arrive
+  DEVICE void arrive() const {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    asm volatile(
+        "{\n\t"
+        "mbarrier.arrive.shared.b64 _, [%0];\n\t"
+        "}"
+        :
+        : "r"(smem_addr));
+  }
+
+  // remote arrive
+  DEVICE void arrive(uint32_t cta_id, uint32_t pred = true) const {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 remAddr32;\n\t"
+        "setp.eq.u32 p, %2, 1;\n\t"
+        "@p mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+        "@p mbarrier.arrive.shared::cluster.b64  _, [remAddr32];\n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(cta_id), "r"(pred));
+  }
+
+  DEVICE void wait(uint32_t phase) {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    // Arbitrarily large timer value after which try-wait expires and re-tries.
+    uint32_t ticks = 0x989680;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred       P1; \n\t"
+        "LAB_WAIT: \n\t"
+        "mbarrier.try_wait.parity.shared.b64 P1, [%0], %1, %2; \n\t"
+        "@P1 bra.uni DONE; \n\t"
+        "bra.uni     LAB_WAIT; \n\t"
+        "DONE: \n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(phase), "r"(ticks));
+  }
+
+  DEVICE uint32_t try_wait(uint32_t phase) {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    uint32_t waitComplete;
+
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1; \n\t"
+        "mbarrier.try_wait.parity.shared.b64 P1, [%1], %2; \n\t"
+        "selp.b32 %0, 1, 0, P1; \n\t"
+        "}"
+        : "=r"(waitComplete)
+        : "r"(smem_addr), "r"(phase));
+
+    return waitComplete;
+  }
+
+  DEVICE void invalidate() {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    asm volatile(
+        "{\n\t"
+        "mbarrier.ival.shared.b64 [%0]; \n\t"
+        "}"
+        :
+        : "r"(smem_addr));
+  }
+
+  // These are TMA related barrier methods.
+  // CULTASS implements it in another barrier.
+  // We put them together.
+  DEVICE void arrive_and_expect_tx(uint32_t transaction_bytes) {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    asm volatile(
+        "{\n\t"
+        "mbarrier.arrive.expect_tx.shared.b64 _, [%1], %0; \n\t"
+        "}"
+        :
+        : "r"(transaction_bytes), "r"(smem_addr));
+  }
+
+  DEVICE void arrive_and_expect_tx(uint32_t transaction_bytes, uint32_t cta_id,
+                                   uint32_t pred) {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 remAddr32;\n\t"
+        "setp.eq.u32 p, %2, 1;\n\t"
+        "@p mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+        "@p mbarrier.arrive.expect_tx.shared::cluster.b64  _, [remAddr32], "
+        "%3;\n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(cta_id), "r"(pred), "r"(transaction_bytes));
+  }
+
+  DEVICE void expect_transaction(uint32_t transaction_bytes) const {
+    uint32_t smem_addr = cast_smem_ptr_to_uint(&barrier_);
+    asm volatile(
+        "{\n\t"
+        "mbarrier.expect_tx.shared.b64 [%1], %0; \n\t"
+        "}"
+        :
+        : "r"(transaction_bytes), "r"(smem_addr));
   }
 };
 
-template <int BlockM, int BlockN, int BlockK, int ClusterX, int ClusterY,
-          int ClusterZ, int Stages>
-struct BlockMma {
-  using MainloopPipeline =
-      PipelineTmaAsync<Stages, ClusterX, ClusterY, ClusterZ>;
-  using PipelineState = PipelineState<Stages>;
-  struct SharedStorage {
-    struct __align__(128) TensorStorage {
-      WgMma::AType smem_A[BlockM * BlockK * Stages];
-      WgMma::BType smem_B[BlockN * BlockK * Stages];
-    }
-    tensors;
-    typename MainloopPipeline::SharedStorage pipeline;
-  };
+enum class BarrierStatus : uint32_t {
+  WaitAgain = 0u,
+  WaitDone = 1u,
+  WaitOnly = 2u
+};
 
-  using TensorStorage = typename SharedStorage::TensorStorage;
-  using PipelineStorage = typename MainloopPipeline::SharedStorage;
+struct ArrivalToken {
+  HOST_DEVICE ArrivalToken(BarrierStatus barrier_status)
+      : barrier_status(barrier_status) {}
 
-  struct Arguments {
-    WgMma::AType const* ptr_A;
-    const int lda;
-    WgMma::BType const* ptr_B;
-    const int ldb;
-  };
+  HOST_DEVICE ArrivalToken() = delete;
 
-  struct Params {
-    // swizzle requires at least 3D, with the outermost dim = 1
-    // currently we don't consider multicast for A
-    // and assume ClusterY == 1
-    SM90_TMA_LOAD_3D tma_load_op_a;
-    TmaDescriptor tma_desc_a;
-    // currently we only consider multicast for B
-    // and assume ClusterX > 1
-    SM90_TMA_LOAD_MULTICAST_3D tma_load_op_b;
-    TmaDescriptor tma_desc_b;
-  };
+  HOST_DEVICE BarrierStatus get() const { return barrier_status; }
 
-  static constexpr int TmaTransactionBytes =
-      BlockM * BlockK * sizeof(WgMma::AType) +
-      BlockN * BlockK * sizeof(WgMma::BType);
-
-  DEVICE
-  static void prefetch_tma_descriptors(Params mainloop_params) {
-    prefetch_tma_descriptor(&mainloop_params.tma_desc_a);
-    prefetch_tma_descriptor(&mainloop_params.tma_desc_b);
+  HOST_DEVICE bool operator==(ArrivalToken const& other) const {
+    return barrier_status == other.get();
   }
 
-  template <typename DType>
-  DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline,
-                   PipelineState smem_pipeline_write, DType const* ptr_a,
-                   DType const* ptr_b, int m_coord, int n_coord, int k_coord,
-                   int k_tile_count, int thread_idx,
-                   uint32_t block_rank_in_cluster,
-                   TensorStorage& shared_tensors) {
-    int warp_idx = warp_id_in_block();
-    int warp_idx_in_warp_group = warp_id_in_warp_group();
-    int lane_predicate = elect_one_sync();
+  HOST_DEVICE bool operator!=(ArrivalToken const& other) const {
+    return !(*this == other);
+  }
 
-    int global_major_offset_a = m_coord * BlockM;
-    int global_major_offset_b = n_coord * BlockN;
+  BarrierStatus barrier_status;
+};
 
-    // for now only consider multicast for B
-    uint16_t mcast_mask_b = 0;
-    for (int i = 0; i < ClusterX; ++i) {
-      mcast_mask_b |= (1 << (i));
-    }
-    global_major_offset_b +=
-        block_rank_in_cluster % ClusterX * (BlockN / ClusterX);
+struct ProducerToken : public ArrivalToken {};
 
-    if (warp_idx_in_warp_group == 0 && lane_predicate) {
-      DType* smem_a = shared_tensors.smem_A;
-      DType* smem_b = shared_tensors.smem_B;
+struct ConsumerToken : public ArrivalToken {};
 
-      for (; k_tile_count > 0; --k_tile_count) {
-        pipeline.producer_acquire(smem_pipeline_write);
+template <int Stages>
+struct PipelineState {
+  int index = 0;
+  uint32_t phase = 0;
+  uint32_t count = 0;
 
-        using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-        BarrierType* tma_barrier =
-            pipeline.producer_get_barrier(smem_pipeline_write);
+  DEVICE PipelineState() : index(), phase(), count() {}
 
-        int write_stage = smem_pipeline_write.index();
-        DType* smem_a_k_tile = smem_a + write_stage * BlockM * BlockK;
-        DType* smem_b_k_tile = smem_b + write_stage * BlockN * BlockK;
-        int global_minor_offset_a = k_coord * BlockK;
-        int global_minor_offset_b = k_coord * BlockK;
+  DEVICE PipelineState(int index, uint32_t phase, uint32_t count)
+      : index(index), phase(phase), count(count) {}
 
-        mainloop_params.tma_load_op_a.copy((void*)(&mainloop_params.tma_desc_a),
-                                           *tma_barrier, (void*)smem_a_k_tile,
-                                           global_minor_offset_a,
-                                           global_major_offset_a, 0);
-
-        mainloop_params.tma_load_op_b.copy(
-            (void*)(&mainloop_params.tma_desc_b), *tma_barrier, mcast_mask_b,
-            (void*)smem_b_k_tile, global_minor_offset_b, global_major_offset_b,
-            mcast_mask_b);
-
-        ++k_coord;
-        ++smem_pipeline_write;
+  DEVICE void operator++() {
+    if constexpr (Stages > 0) {
+      ++index;
+      ++count;
+      if (index == Stages) {
+        index = 0;
+        phase ^= 1;
       }
     }
   }
+
+  DEVICE PipelineState advance(uint32_t num_iterations) {
+    if constexpr (Stages > 0) {
+      if ((num_iterations < Stages) && (index + num_iterations) >= Stages) {
+        phase ^= 1;
+      }
+      if ((num_iterations >= Stages) &&
+          (((index + num_iterations) / Stages) % 2) == 1) {
+        phase ^= 1;
+      }
+      index = (index + num_iterations) % Stages;
+      count += num_iterations;
+    }
+    return *this;
+  }
+
+  DEVICE static PipelineState make_pipeline_state(PipelineState start_state,
+                                                  uint32_t num_iterations) {
+    return start_state.advance(num_iterations);
+  }
 };
 
-using MmaBarrier = OrderedSequenceBarrier<2, 2>;
-using LoadBarrier = OrderedSequenceBarrier<1, 2>;
-using Mainloop =
-    BlockMma<BLOCKM, BLOCKN, BLOCKK, CLUSTER_M, CLUSTER_N, 1, STAGES>;
-using SmemSwizzle = Swizzle<3, 4, 3>;
-using Scheduler =
-    TileScheduler<CLUSTER_M, CLUSTER_N, 1, BLOCKM, BLOCKN, BLOCKK>;
-static constexpr uint32_t LoadRegisterRequirement = 40;
-static constexpr uint32_t MmaRegisterRequirement = 232;
+template <int Depth, int Length>
+struct OrderedBarrierSharedStorage {
+  Barrier barrier[Depth][Length];
+};
 
+template <int Depth, int Length>
+struct OrderedBarrierParams {
+  uint32_t group_id;
+  uint32_t group_size;
+};
+
+template <int Depth, int Length>
+struct OrderedBarrier {
+  OrderedBarrierParams<Depth, Length> params;
+  Barrier* barrier_ptr;
+  PipelineState<Depth> state;
+
+  DEVICE OrderedBarrier() = delete;
+
+  DEVICE OrderedBarrier(OrderedBarrierSharedStorage<Depth, Length>& storage,
+                        OrderedBarrierParams<Depth, Length>& params)
+      : params(params),
+        barrier_ptr(&storage.barrier[0][0]),
+        state({0, params.group_id == 0, 0}) {
+    int warp_idx = threadIdx.x / WARP_SIZE;
+    int lane_predicate = elect_one_sync();
+    if (warp_idx == 0 && lane_predicate == 1) {
+      for (int i = 0; i < Depth; ++i) {
+        for (int j = 0; j < Length; ++j) {
+          barrier_ptr[i * Length + j].init(params.group_size);
+        }
+      }
+    }
+    utils::fence_barrier_init();
+  }
+
+  DEVICE void wait() {
+    get_barrier_for_current_stage(params.group_id).wait(state.phase);
+  }
+
+  // This will the next slot's barrier. Gurantee -> order.
+  DEVICE void arrive() {
+    int signaling_id = (params.group_id + 1) % Length;
+    get_barrier_for_current_stage(signaling_id).arrive();
+    ++state;
+  }
+
+  DEVICE void advance() { ++state; }
+
+  DEVICE Barrier& get_barrier_for_current_stage(int group_id) {
+    return barrier_ptr[state.index * Length + group_id];
+  }
+};
+
+template <int Stages>
+DEVICE PipelineState<Stages> make_producer_start_state() {
+  // start from the next phase, so that the barrier wait doesn't block
+  // execution.
+  return {0, 1, 0};
+}
+
+template <int Stages>
+struct TmaPipelineSharedStorage {
+  Barrier full_barrier[Stages];
+  Barrier empty_barrier[Stages];
+};
+
+template <int Stages>
+struct TmaPipelineParams {
+  enum class ThreadCategory {
+    NonParticipant,
+    Producer,
+    Consumer,
+    ProducerConsumer
+  };
+
+  uint32_t transaction_bytes = 0;
+  ThreadCategory role = ThreadCategory::NonParticipant;
+  uint32_t is_leader = 0;
+  uint32_t num_consumers = 0;
+};
+
+// TmaPipeline structure. Follow CUTLASS impl.
+template <int Stages, int ClusterM, int ClusterN>
+struct TmaPipeline {
+  uint32_t dst_blockid = 0;
+  uint32_t is_signaling_thread = 0;
+  Barrier* full_barrier_ptr = nullptr;
+  Barrier* empty_barrier_ptr = nullptr;
+  TmaPipelineParams<Stages> params;
+
+  DEVICE TmaPipeline(TmaPipelineSharedStorage<Stages>& storage,
+                     TmaPipelineParams<Stages> p)
+      : full_barrier_ptr(&storage.full_barrier[0]),
+        empty_barrier_ptr(&storage.empty_barrier[0]),
+        params(p) {
+    int warp_idx = threadIdx.x / WARP_SIZE;
+    int lane_predicate = elect_one_sync();
+
+    if (warp_idx == 0 && lane_predicate == 1) {
+      for (int i = 0; i < Stages; ++i) {
+        full_barrier_ptr[i].init(1);
+      }
+      // Question: why num_consumers = WARP_GROUP_SIZE?
+      uint32_t const num_consumer_warpgroups_per_cluster =
+          params.num_consumers / WARP_GROUP_SIZE;
+      // Question: why this? I guess it's the same row and col.
+      uint32_t const multicast_consumer_arrival_count =
+          (ClusterM + ClusterN - 1) * num_consumer_warpgroups_per_cluster;
+      for (int i = 0; i < Stages; ++i) {
+        empty_barrier_ptr[i].init(multicast_consumer_arrival_count);
+      }
+    }
+    utils::fence_barrier_init();
+
+    // CUTLASS says the following logic is used to equally spread the duty of
+    // SYNCS Empty Arriveal to 128 threads.
+    dim3 block_id = block_id_in_cluster();
+    static constexpr uint32_t cluster_size = ClusterM * ClusterN;
+    static_assert(cluster_size <= MAX_CLUSTER_SIZE, "Cluster size too large!");
+    if (params.num_consumers % WARP_GROUP_SIZE == 0) {
+      int thread_idx = threadIdx.x % WARP_GROUP_SIZE;
+      is_signaling_thread =
+          (thread_idx % (WARP_GROUP_SIZE / MAX_CLUSTER_SIZE)) == 0;
+      uint32_t thread_row = warp_idx % 4;
+      uint32_t thread_col = (thread_idx / 8) % 4;
+      auto swizzle = Swizzle<2, 0, -2>{};
+      dst_blockid = swizzle(thread_row * 4 + thread_col);
+    } else if (params.num_consumers == 32) {
+      int thread_idx = threadIdx.x % 32;
+      is_signaling_thread = (thread_idx % (32 / MAX_CLUSTER_SIZE)) == 0;
+      uint32_t thread_row = thread_idx / 8;
+      uint32_t thread_col = (thread_idx % 8) / 2;
+      dst_blockid = thread_row * 4 + thread_col;
+    } else {
+      is_signaling_thread = 0;
+      // Should not arrive there.
+      assert(false);
+    }
+
+    is_signaling_thread &= dst_blockid < cluster_size;
+    is_signaling_thread &= is_same_row_or_col(dst_blockid, block_id);
+  }
+
+  DEVICE bool is_same_row_or_col(int dst_block_id, dim3 block_id) {
+    return ((dst_block_id % ClusterM) == block_id.x) ||
+           ((dst_block_id / ClusterM) == block_id.y);
+  }
+
+  DEVICE void producer_acquire(PipelineState<Stages> state,
+                               ProducerToken barrier_token = {
+                                   BarrierStatus::WaitAgain}) {
+    if (barrier_token != BarrierStatus::WaitDone) {
+      empty_barrier_ptr[state.index].wait(state.phase);
+    }
+    if (barrier_token == BarrierStatus::WaitOnly) {
+      return;
+    }
+
+    if (params.is_leader) {
+      full_barrier_ptr[state.index].arrive_and_expect_tx(
+          params.transaction_bytes);
+    }
+  }
+
+  DEVICE void producer_tail(PipelineState<Stages> state) {
+    for (int i = 0; i < Stages; ++i) {
+      producer_acquire(state, {BarrierStatus::WaitOnly});
+      ++state;
+    }
+  }
+
+  DEVICE uint64_t* producer_get_barrier(PipelineState<Stages> state) {
+    return reinterpret_cast<uint64_t*>(&full_barrier_ptr[state.index]);
+  }
+
+  DEVICE ConsumerToken consumer_try_wait(PipelineState<Stages> state,
+                                         uint32_t skip_wait = false) {
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    uint32_t barrier_status =
+        full_barrier_ptr[state.index].try_wait(state.phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  DEVICE void consumer_wait(PipelineState<Stages> state) {
+    full_barrier_ptr[state.index].wait(state.phase);
+  }
+
+  DEVICE void consumer_wait(PipelineState<Stages> state,
+                            ConsumerToken barrier_token) {
+    if (barrier_token == BarrierStatus::WaitAgain) {
+      full_barrier_ptr[state.index].wait(state.phase);
+    }
+  }
+
+  DEVICE void consumer_release(PipelineState<Stages> state,
+                               uint32_t skip = false) {
+    empty_barrier_ptr[state.index].arrive(dst_blockid,
+                                          is_signaling_thread & (!skip));
+  }
+};
+
+template <int Stages>
+struct EpilogueLoadPipelineSharedStorage {
+  Barrier full_barrier[Stages];
+  Barrier empty_barrier[Stages];
+};
+
+template <int Stages>
+struct EpilgoueLoadPipelineParams {
+  enum class ThreadCategory {
+    NonParticipant,
+    Producer,
+    Consumer,
+    ProducerConsumer
+  };
+
+  ThreadCategory role = ThreadCategory::NonParticipant;
+  uint32_t transaction_bytes = 0;
+  uint32_t producer_arv_count = 1;
+  uint32_t consumer_arv_count = 1;
+  uint32_t dst_blockid = block_rank_in_cluster();
+};
+
+// This seems not necessary in this example, so I didn't finish it.
+template <int Stages>
+struct EpilogueLoadPipeline {
+  Barrier* full_barrier_ptr = nullptr;
+  Barrier* empty_barrier_ptr = nullptr;
+  EpilgoueLoadPipelineParams<Stages> params;
+
+  DEVICE EpilogueLoadPipeline(
+      EpilogueLoadPipelineSharedStorage<Stages>& storage,
+      EpilgoueLoadPipelineParams<Stages>& params)
+      : full_barrier_ptr(&storage.full_barrier[0]),
+        empty_barrier_ptr(&storage.empty_barrier[0]),
+        params(params) {
+    int warp_idx = threadIdx.x / WARP_SIZE;
+    int lane_predicate = elect_one_sync();
+
+    if (warp_idx == 0 && lane_predicate == 1) {
+      for (int i = 0; i < Stages; ++i) {
+        full_barrier_ptr[i].init(params.producer_arv_count);
+        empty_barrier_ptr[i].init(params.consumer_arv_count);
+      }
+    }
+    utils::fence_barrier_init();
+  }
+
+  DEVICE void producer_acquire(PipelineState<Stages> state,
+                               ProducerToken barrier_token = {
+                                   BarrierStatus::WaitAgain}) {
+    if (barrier_token == BarrierStatus::WaitAgain) {
+      empty_barrier_ptr[state.index].wait(state.phase);
+    }
+  }
+
+  DEVICE void producer_expect_transaction(PipelineState<Stages> state) {
+    full_barrier_ptr[state.index].expect_transaction(params.transaction_bytes);
+  }
+};
+
+// A simpilified tile scheduler that always takes AlongN and non swizzle
+template <int BlockM, int BlockN, int ClusterM, int ClusterN>
+struct TileScheduler {
+  int linear_idx;
+  int m_blocks;
+  int n_blocks;
+
+  struct WorkInfo {
+    int m_idx;
+    int n_idx;
+    bool valid;
+  };
+
+  DEVICE TileScheduler(int M, int N) { init(M, N); }
+
+  DEVICE void init(int M, int N) {
+    linear_idx = blockIdx.x + blockIdx.y * gridDim.x;
+    get_blocks_m_n(M, N);
+  }
+
+  DEVICE WorkInfo get_current_work_info() {
+    int m_idx, n_idx;
+    get_current_m_n_idx(m_idx, n_idx, m_blocks, n_blocks);
+    return {m_idx, n_idx, linear_idx < m_blocks * n_blocks};
+  }
+
+  DEVICE void advance(int number = 1) {
+    linear_idx += number * gridDim.x * gridDim.y;
+  }
+
+  DEVICE void get_current_m_n_idx(int& m_idx, int& n_idx, int m_blocks,
+                                  int n_blocks) {
+    int div_cluster_x = linear_idx / ClusterM;
+    int mod_cluster_x = linear_idx % ClusterM;
+    int div_cluster_xy = div_cluster_x / ClusterN;
+    int mod_cluster_xy = div_cluster_x % ClusterN;
+    int clusters_per_row = n_blocks / ClusterN;
+    int cluster_row = div_cluster_xy / clusters_per_row;
+    int cluster_col = div_cluster_xy % clusters_per_row;
+    m_idx = cluster_row * ClusterM + mod_cluster_x;
+    n_idx = cluster_col * ClusterN + mod_cluster_xy;
+  }
+
+  DEVICE void get_blocks_m_n(int M, int N) {
+    m_blocks = ((M + BlockM - 1) / BlockM + ClusterM - 1) / ClusterM * ClusterM;
+    n_blocks = ((N + BlockN - 1) / BlockN + ClusterN - 1) / ClusterN * ClusterN;
+  }
+};
+
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
+struct MainloopSharedStorage {
+  alignas(128) AType smem_A[BlockM * BlockK * Stages];
+  alignas(128) BType smem_B[BlockN * BlockK * Stages];
+  TmaPipelineSharedStorage<Stages> pipeline;
+};
+
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
+struct MainloopParams {};
+
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
+struct Mainloop {
+  static_assert(std::is_same<AType, BType>::value);
+  static constexpr uint32_t TmaTransactionBytes =
+      (BlockM + BlockN) * BlockK * Stages * sizeof(AType);
+
+  DEVICE static void prefetch_tma_descriptor(
+      const utils::TmaDescriptor* tensormap_a,
+      const utils::TmaDescriptor* tensormap_b) {
+    utils::prefetch_tma_descriptor(tensormap_a);
+    utils::prefetch_tma_descriptor(tensormap_b);
+  }
+
+  DEVICE void load(const utils::TmaDescriptor& tensormap_a,
+                   const utils::TmaDescriptor& tensormap_b,
+                   TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline,
+                   PipelineState<Stages> mainloop_pipeline_state, int m_idx,
+                   int n_idx, int k_tile_count, uint32_t block_rank_in_cluster,
+                   MainloopSharedStorage<AType, BType, CType, AccumType, BlockM,
+                                         BlockN, BlockK, ClusterM, ClusterN,
+                                         Stages>& shared_storage) {
+    int warp_idx = threadIdx.x / WARP_SIZE;
+    int warp_idx_in_warp_group = warp_idx % 4;
+    int lane_predicate = elect_one_sync();
+
+    if (warp_idx_in_warp_group == 0 && lane_predicate == 1) {
+      int block_id_x_in_cluster = block_rank_in_cluster % ClusterM;
+      int block_id_y_in_cluster = block_rank_in_cluster / ClusterM;
+      uint16_t mcast_mask_a = 0;
+      uint16_t mcast_mask_b = 0;
+      constexpr int multicast_stride_a = BlockM / ClusterN;
+      constexpr int multicast_stride_b = BlockN / ClusterM;
+      if constexpr (ClusterM > 1) {
+        // multicast B
+        for (int i = 0; i < ClusterM; ++i) {
+          mcast_mask_b |=
+              (uint16_t(1) << (block_id_y_in_cluster * ClusterM + i));
+        }
+      }
+      if constexpr (ClusterN > 1) {
+        // multicast A
+        for (int i = 0; i < ClusterN; ++i) {
+          mcast_mask_a |=
+              (uint16_t(1) << (block_id_x_in_cluster + i * ClusterN));
+        }
+      }
+
+      for (int i = 0; i < k_tile_count; ++i) {
+        mainloop_pipeline.producer_acquire(mainloop_pipeline_state);
+
+        int stage = mainloop_pipeline_state.index;
+        void* smem_ptr_A = reinterpret_cast<void*>(shared_storage.smem_A +
+                                                   stage * BlockM * BlockK);
+        void* smem_ptr_B = reinterpret_cast<void*>(shared_storage.smem_B +
+                                                   stage * BlockN * BlockK);
+
+        // load A and B using the same barrier
+        if constexpr (ClusterN > 1) {
+          // multicast copy A
+          utils::tma_copy_3d_multicast(
+              &tensormap_a,
+              *mainloop_pipeline.producer_get_barrier(mainloop_pipeline_state),
+              mcast_mask_a, smem_ptr_A,
+              i * BlockK,  // innermost dim moves fastest
+              m_idx * BlockM + block_id_y_in_cluster * multicast_stride_a, 0);
+        } else {
+          // normal copy A
+          utils::tma_copy_3d(
+              &tensormap_a,
+              *mainloop_pipeline.producer_get_barrier(mainloop_pipeline_state),
+              smem_ptr_A, i * BlockK, m_idx * BlockM, 0);
+        }
+
+        if constexpr (ClusterM > 1) {
+          // multicast copy B
+          utils::tma_copy_3d_multicast(
+              &tensormap_b,
+              *mainloop_pipeline.producer_get_barrier(mainloop_pipeline_state),
+              mcast_mask_b, smem_ptr_B,
+              i * BlockK,  // innermost dim moves fastest
+              n_idx * BlockN + block_id_x_in_cluster * multicast_stride_b, 0);
+        } else {
+          // normal copy B
+          utils::tma_copy_3d(
+              &tensormap_b,
+              *mainloop_pipeline.producer_get_barrier(mainloop_pipeline_state),
+              smem_ptr_B, i * BlockK, n_idx * BlockN, 0);
+        }
+
+        // this moves to next stage, but doesn't affect the outer state
+        // because this state is passed by copy, not reference.
+        ++mainloop_pipeline_state;
+      }
+    }
+  }
+
+  DEVICE void load_tail(
+      TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline,
+      PipelineState<Stages> mainloop_pipeline_state) {
+    int warp_idx = threadIdx.x / WARP_SIZE;
+    int warp_idx_in_warp_group = warp_idx % 4;
+    int lane_predicate = elect_one_sync();
+
+    if (warp_idx_in_warp_group == 0 && lane_predicate == 1) {
+      mainloop_pipeline.producer_tail(mainloop_pipeline_state);
+    }
+  }
+};
+
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
+struct EpilogueSharedStorage {};
+
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
+struct EpilogueParams {};
+
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
+struct Epilogue {
+  DEVICE static void prefetch_tma_descriptor(
+      [[maybe_unused]] const utils::TmaDescriptor* tensormap_a,
+      [[maybe_unused]] const utils::TmaDescriptor* tensormap_b) {}
+};
+
+using LoadWarpOrderBarrier = OrderedBarrier<1, 2>;
+using LoadWarpOrderBarrierSharedStorage = OrderedBarrierSharedStorage<1, 2>;
+using LoadWarpOrderBarrierParams = OrderedBarrierParams<1, 2>;
+
+using MathWarpGroupOrderBarrier = OrderedBarrier<2, 2>;
+using MathWarpGroupOrderBarrierSharedStorage =
+    OrderedBarrierSharedStorage<2, 2>;
+using MathWarpGroupOrderBarrierParams = OrderedBarrierParams<2, 2>;
+
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
 struct KernelSharedStorage {
-  typename Mainloop::SharedStorage mainloop;
-  MmaBarrier::SharedStorage mma_order;
-  LoadBarrier::SharedStorage load_order;
+  alignas(128)
+      MainloopSharedStorage<AType, BType, CType, AccumType, BlockM, BlockN,
+                            BlockK, ClusterM, ClusterN, Stages> mainloop;
+  // epilogue: no shared storage
+  alignas(16) MathWarpGroupOrderBarrierSharedStorage math_wg_order;
+  alignas(16) LoadWarpOrderBarrierSharedStorage load_order;
 };
 
-struct KernelParams {
-  Mainloop::Params mainloop;
-  Scheduler::Params scheduler;
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
+struct GemmKernelParams {
+  GemmParams<AType, BType, CType, AccumType> gemm_params;
+  MainloopParams<AType, BType, CType, AccumType, BlockM, BlockN, BlockK,
+                 ClusterM, ClusterN, Stages>
+      mainloop_params;
+  EpilogueParams<AType, BType, CType, AccumType, BlockM, BlockN, BlockK,
+                 ClusterM, ClusterN, Stages>
+      epilogue_params;
 };
 
-template <class AType, class BType, class CType, class AccumType>
+template <class AType, class BType, class CType, class AccumType, int BlockM,
+          int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
 __global__ void gpu_gemm_kernel(
-    GemmParams<AType, BType, CType, AccumType> gemm_params,
-    KernelParams kernel_params) {
-  int warp_group_id = threadIdx.x / WARP_GROUP_SIZE;
-  int thread_idx_in_warp_group = threadIdx.x % WARP_GROUP_SIZE;
+    // GemmParams<AType, BType, CType, AccumType> gemm_params,
+    GemmKernelParams<AType, BType, CType, AccumType, BlockM, BlockN, BlockK,
+                     ClusterM, ClusterN, Stages>
+        kernel_params,
+    const __grid_constant__ utils::TmaDescriptor tensormap_a,
+    const __grid_constant__ utils::TmaDescriptor tensormap_b) {
+  // we follow CUTLASS warp specialization
+  enum class WarpGroupRole { Producer = 0, Consumer0 = 1, Consumer1 = 2 };
+
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    Warp3 = 3
+  };
+
+  extern __shared__ uint8_t raw_shared_mem[];
+  // this is CUTLASS manner shared storage cast
+  KernelSharedStorage<AType, BType, CType, AccumType, BlockM, BlockN, BlockK,
+                      ClusterM, ClusterN, Stages>& shared_storage =
+      *reinterpret_cast<
+          KernelSharedStorage<AType, BType, CType, AccumType, BlockM, BlockN,
+                              BlockK, ClusterM, ClusterN, Stages>*>(
+          raw_shared_mem);
+
+  // get useful ids:
+  // int thread_idx = threadIdx.x;
+  // int lane_idx = threadIdx.x % WARP_SIZE;
   int warp_idx = threadIdx.x / WARP_SIZE;
-  int lane_idx = threadIdx.x % WARP_SIZE;
-  int warp_idx_in_warp_group = thread_idx_in_warp_group / WARP_SIZE;
-  int block_idx_in_cluster = block_rank_in_cluster();
+  int warp_idx_in_warp_group =
+      threadIdx.x / WARP_SIZE % WARP_NUMBER_IN_WARP_GROUP;
+  int warp_group_thread_idx = threadIdx.x % WARP_GROUP_SIZE;
+  uint32_t block_idx_in_cluster = block_rank_in_cluster();
+
+  // get roles
+  auto warp_group_role = WarpGroupRole(threadIdx.x / WARP_GROUP_SIZE);
+  auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
   int lane_predicate = elect_one_sync();
 
-  // Prefetch TMA descriptors
-  if (warp_idx == 0 && lane_predicate) {
-    Mainloop::prefetch_tma_descriptors(kernel_params.mainloop);
-    // Epilogue...
+  PRINT_BT(0, 0, 0, "1\n");
+
+  // only the first thread in a block launch tma prefetch
+  if ((warp_idx == 0) && lane_predicate) {
+    Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+             ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
+                                                        &tensormap_b);
+    Epilogue<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+             ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
+                                                        &tensormap_b);
   }
 
-  extern __shared__ uint8_t raw_smem[];
-  KernelSharedStorage& shared_storage =
-      *reinterpret_cast<KernelSharedStorage*>(raw_smem);
+  PRINT_BT(0, 0, 0, "2\n");
 
-  // Mma barrier
-  MmaBarrier::Params mma_barrier_params;
-  mma_barrier_params.group_id = warp_group_id - 1;
-  mma_barrier_params.group_size = WARP_GROUP_SIZE;
-  MmaBarrier mma_barrier(shared_storage.mma_order, mma_barrier_params);
-
-  // Load barrier
-  LoadBarrier::Params load_barrier_params;
-  load_barrier_params.group_id = warp_idx_in_warp_group == 0 ? 0 : 1;
-  load_barrier_params.group_size = WARP_SIZE;
-  LoadBarrier load_barrier(shared_storage.load_order, load_barrier_params);
-
-  // Mainloop pipeline
-  using MainloopPipeline = typename Mainloop::MainloopPipeline;
-  typename MainloopPipeline::Params mainloop_pipeline_params;
-  if (warp_group_id == 0 && warp_idx_in_warp_group == 0) {
-    mainloop_pipeline_params.role = MainloopPipeline::ThreadCategory::Producer;
+  // mainloop pipeline
+  TmaPipelineParams<Stages> mainloop_pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    mainloop_pipeline_params.role =
+        TmaPipelineParams<Stages>::ThreadCategory::Producer;
   }
-  if (warp_group_id == 1 || warp_group_id == 2) {
-    mainloop_pipeline_params.role = MainloopPipeline::ThreadCategory::Consumer;
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    mainloop_pipeline_params.role =
+        TmaPipelineParams<Stages>::ThreadCategory::Consumer;
   }
-  mainloop_pipeline_params.is_leader = thread_idx_in_warp_group == 0;
+  mainloop_pipeline_params.is_leader = warp_group_thread_idx == 0;
   mainloop_pipeline_params.num_consumers = WARP_GROUP_SIZE;
-  mainloop_pipeline_params.transaction_bytes = Mainloop::TmaTransactionBytes;
-  MainloopPipeline mainloop_pipeline(shared_storage.mainloop.pipeline,
-                                     mainloop_pipeline_params);
+  mainloop_pipeline_params.transaction_bytes =
+      Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+               ClusterN, Stages>::TmaTransactionBytes;
+  TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline(
+      shared_storage.mainloop.pipeline, mainloop_pipeline_params);
 
-  // Epilogue pipeline load and store
-  // TODO...
+  // epilogue pipeline: load and store
+  // seems not necessary in this example.
 
-  // Pipeline state
-  typename Mainloop::PipelineState mainloop_pipe_consumer_state;
-  // Epilogue load pipe...
+  // barriers used to control warpgroups
+  LoadWarpOrderBarrierParams load_order_params;
+  load_order_params.group_id =
+      producer_warp_role == ProducerWarpRole::Mainloop ? 0 : 1;
+  load_order_params.group_size = WARP_SIZE;
+  LoadWarpOrderBarrier load_order(shared_storage.load_order, load_order_params);
 
-  PipelineState mainloop_pipe_producer_state =
-      make_producer_start_state<MainloopPipeline>();
-  // Epilogue pipe...
+  MathWarpGroupOrderBarrierParams math_wg_order_params;
+  math_wg_order_params.group_id = threadIdx.x / WARP_GROUP_SIZE - 1;
+  math_wg_order_params.group_size = WARP_GROUP_SIZE;
+  MathWarpGroupOrderBarrier math_wg_order(shared_storage.math_wg_order,
+                                          math_wg_order_params);
+
+  PipelineState<Stages> mainloop_pipeline_consumer_state;
+  PipelineState<Stages> mainloop_pipeline_producer_state =
+      make_producer_start_state<Stages>();
+
+  Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+           ClusterN, Stages>
+      mainloop;
 
   auto cluster_wait_fn = [&]() {
-    // We need this to guarantee that the Pipeline init is visible
-    // To all producers and consumer thread blocks in the Cluster
-    cluster_arrive_relaxed();
-    return []() { cluster_wait(); };
+    if constexpr (ClusterM * ClusterN > 1) {
+      utils::cluster_arrive_relaxed();
+      return []() { utils::cluster_wait(); };
+    } else {
+      __syncthreads();
+      return []() {};
+    }
   }();
 
-  // Mainloop
-  Mainloop mainloop;
-  // Eiplogue ...
+  PRINT_BT(0, 0, 0, "3\n");
 
-  // Scheduler
-  Scheduler scheduler{kernel_params.scheduler};
-  
-  // Tile counts
-  int k_tile_count = gemm_params.K / BLOCKK;
-  // Epilogue's ...
+  TileScheduler<BlockM, BlockN, ClusterM, ClusterN> scheduler(
+      kernel_params.gemm_params.M, kernel_params.gemm_params.N);
+  int k_tile_count = (kernel_params.gemm_params.K + BlockK - 1) / BlockK;
 
-  if (warp_group_id == 2) {
-    scheduler.advance_to_next_work();
-    mainloop_pipe_consumer_state.advance(k_tile_count);
-    // Epilogue ...
+  if (warp_group_role == WarpGroupRole::Consumer1) {
+    scheduler.advance();
+    mainloop_pipeline_consumer_state.advance(k_tile_count);
   }
 
-  auto work_tile_info = scheduler.get_current_work();
+  auto work_tile_info = scheduler.get_current_work_info();
 
   cluster_wait_fn();
 
-  if (warp_group_id == 0) {
-    warpgroup_reg_dealloc<LoadRegisterRequirement>();
+  PRINT_BT(0, 0, 0, "4\n");
 
-    // producer
-    if (warp_idx_in_warp_group == 0) {
-      // iterate all tiles and load
-      bool do_arrive = true;
+  if (warp_group_role == WarpGroupRole::Producer) {
+    // you can't only dealloc without alloc in consumer!
+    // Don't know why the magic number 40
+    // utils::warpgroup_reg_dealloc<40>();
 
-      while (work_tile_info.is_valid()) {
-        int m_coord = work_tile_info.M_idx;
-        int n_coord = work_tile_info.N_idx;
-        int k_coord = 0;
-        
-        mainloop.load(kernel_params.mainloop, mainloop_pipeline,
-                      mainloop_pipe_producer_state, gemm_params.A, gemm_params.B,
-                      m_coord, n_coord, k_coord, k_tile_count, lane_idx,
-                      block_idx_in_cluster, shared_storage.mainloop.tensors);
-        
-        mainloop_pipe_producer_state.advance(k_tile_count);
+    if (producer_warp_role == ProducerWarpRole::Mainloop) {
+      bool first_arrive = true;
+      while (work_tile_info.valid) {
+        mainloop.load(tensormap_a, tensormap_b, mainloop_pipeline,
+                      mainloop_pipeline_producer_state, work_tile_info.m_idx,
+                      work_tile_info.n_idx, k_tile_count, block_idx_in_cluster,
+                      shared_storage.mainloop);
 
-        if (do_arrive) {
-          do_arrive = false;
-          load_barrier.arrive();
+        mainloop_pipeline_producer_state.advance(k_tile_count);
+        if (first_arrive) {
+          load_order.arrive();
+          first_arrive = false;
         }
-
-        scheduler.advance_to_next_work();
-        work_tile_info = scheduler.get_current_work();
+        scheduler.advance();
+        work_tile_info = scheduler.get_current_work_info();
       }
-    } else if (warp_idx_in_warp_group == 2) {
-      load_barrier.wait();
-      // iterate all tiles and load
+
+      mainloop.load_tail(mainloop_pipeline, mainloop_pipeline_producer_state);
+    } else if (producer_warp_role == ProducerWarpRole::Epilogue && false) {
+      // no need to do epilogue load, so in this example the epilogue producer
+      // is empty
+      load_order.wait();
     }
-  } else {
-    // consumer
-    for (int i = 0; i < 10; ++i) {
-      mma_barrier.wait();
-      // do
-      mma_barrier.arrive();
-      mma_barrier.wait();
-      mma_barrier.arrive();
-    }
+
+  } else if (warp_group_role == WarpGroupRole::Consumer0 ||
+             warp_group_role == WarpGroupRole::Consumer1) {
+    // you can't only alloc without dealloc in producer!
+    // Don't know why the magic number 232
+    // utils::warpgroup_reg_alloc<232>();
   }
 }
 
-__global__ void dummy_kernel() { return; }
-
 template <class AType, class BType, class CType, class AccumType>
 void gpu_gemm(GemmParams<AType, BType, CType, AccumType> gemm_params) {
-  dim3 grid(CLUSTER_M * CLUSTER_N, SM_NUMBER / (CLUSTER_M * CLUSTER_N), 1);
+  int sm_number = get_sm_count();
+  dim3 grid(CLUSTER_M * CLUSTER_N, sm_number / (CLUSTER_M * CLUSTER_N), 1);
   dim3 block(WARP_GROUP_SIZE * WG_NUMBER, 1, 1);
   dim3 cluster(CLUSTER_M, CLUSTER_N, 1);
-  auto* Kernel = gpu_gemm_kernel<AType, BType, CType, AccumType>;
-  size_t smemSizeBytes = sizeof(KernelSharedStorage);
-  // size_t smemSizeBytes;
-  // cudaOccupancyAvailableDynamicSMemPerBlock(&smemSizeBytes, dummy_kernel, 1,
-  // block.x); std::cout << "Available smem per block: " << smemSizeBytes << "
-  // bytes\n";
+  std::cout << "sm_number: " << sm_number << "\n";
+  auto* Kernel = gpu_gemm_kernel<AType, BType, CType, AccumType, BLOCKM, BLOCKN,
+                                 BLOCKK, CLUSTER_M, CLUSTER_N, STAGES>;
+  size_t smemSizeBytes =
+      sizeof(KernelSharedStorage<AType, BType, CType, AccumType, BLOCKM, BLOCKN,
+                                 BLOCKK, CLUSTER_M, CLUSTER_N, STAGES>);
   if (smemSizeBytes >= (48 << 10)) {
     cudaError_t result = cudaFuncSetAttribute(
         Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSizeBytes);
@@ -388,22 +1209,24 @@ void gpu_gemm(GemmParams<AType, BType, CType, AccumType> gemm_params) {
       kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
   CUDA_CHECK(status);
 
+  // tensor_map
+  utils::TmaDescriptor tensormap_a =
+      utils::make_tma_copy_desc<BLOCKM, BLOCKK, 3>(
+          gemm_params.A, gemm_params.M, gemm_params.K, Swizzle<3, 4, 3>{},
+          CLUSTER_N);
+  utils::TmaDescriptor tensormap_b =
+      utils::make_tma_copy_desc<BLOCKN, BLOCKK, 3>(
+          gemm_params.B, gemm_params.N, gemm_params.K, Swizzle<3, 4, 3>{},
+          CLUSTER_M);
+  MainloopParams<AType, BType, CType, AccumType, BLOCKM, BLOCKN, BLOCKK,
+                 CLUSTER_M, CLUSTER_N, STAGES>
+      mainloop_params{};
   /// Prepare kernel params
-  KernelParams params;
-  params.mainloop.tma_load_op_a = SM90_TMA_LOAD_3D();
-  params.mainloop.tma_load_op_b = SM90_TMA_LOAD_MULTICAST_3D();
+  GemmKernelParams<AType, BType, CType, AccumType, BLOCKM, BLOCKN, BLOCKK,
+                   CLUSTER_M, CLUSTER_N, STAGES>
+      params{gemm_params, mainloop_params, {}};
 
-  auto smem_swizzle_a = SmemSwizzle{};
-  auto smem_swizzle_b = SmemSwizzle{};
-  params.mainloop.tma_desc_a = make_tma_copy_desc<BLOCKM, BLOCKK, 3>(
-      gemm_params.A, gemm_params.M, gemm_params.K, smem_swizzle_a, cluster.y);
-  params.mainloop.tma_desc_b = make_tma_copy_desc<BLOCKN, BLOCKK, 3>(
-      gemm_params.B, gemm_params.N, gemm_params.K, smem_swizzle_b, cluster.x);
-  params.scheduler.M = gemm_params.M;
-  params.scheduler.N = gemm_params.N;
-  params.scheduler.K = gemm_params.K;
-
-  void* kernel_params[] = {&gemm_params, &params};
+  void* kernel_params[] = {&params, &tensormap_a, &tensormap_b};
   cudaLaunchConfig_t launch_config;
   launch_config.gridDim = {grid.x, grid.y, grid.z};
   launch_config.blockDim = {block.x, block.y, block.z};
@@ -439,7 +1262,7 @@ int main(int argc, char** argv) {
   std::vector<int> BShape = {N, K};
   std::vector<int> CShape = {M, N};
   auto hA = alloc_cpu_tensor<AType>(AShape);
-  arange_fill(hA, AShape);
+  random_fill(hA, AShape);
   auto hB = alloc_cpu_tensor<BType>(BShape);
   random_fill(hB, BShape);
   auto hC = alloc_cpu_tensor<CType>(CShape);
@@ -488,6 +1311,7 @@ int main(int argc, char** argv) {
   std::cout << "GPU kernel done!\n";
 
   /// copy results
+
   std::cout << "Copying results...\n";
   copy_to_cpu(hC, dC, CShape);
   std::cout << "Copying results done!\n";

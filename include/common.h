@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <time.h>
+#include <stdio.h>
 
 #include <cassert>
 #include <chrono>
@@ -39,9 +40,28 @@ using half_t = half;
 #define HOST_DEVICE __forceinline__ __host__ __device__
 #define DEVICE __forceinline__ __device__
 
-static constexpr int SM_NUMBER = 114;
+int get_sm_count() {
+  int device_id;
+  cudaError_t result = cudaGetDevice(&device_id);
+  if (result != cudaSuccess) {
+    std::cerr << "cudaGetDevice() returned error " << cudaGetErrorString(result)
+              << std::endl;
+    return 1;
+  }
+  int multiprocessor_count;
+  result = cudaDeviceGetAttribute(&multiprocessor_count,
+                                  cudaDevAttrMultiProcessorCount, device_id);
+  if (result != cudaSuccess) {
+    std::cerr << "cudaDeviceGetAttribute() returned error "
+              << cudaGetErrorString(result) << std::endl;
+    return 1;
+  }
+  return multiprocessor_count;
+}
+
 static constexpr int MAX_CLUSTER_SIZE = 16;
 static constexpr int WARP_GROUP_SIZE = 128;
+static constexpr int WARP_NUMBER_IN_WARP_GROUP = 4;
 static constexpr int WARP_SIZE = 32;
 
 #define REQUIRES(...) typename std::enable_if<(__VA_ARGS__)>::type* = nullptr

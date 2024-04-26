@@ -69,7 +69,7 @@ class MMA_Traits:
         self.B_frag_type = SmemDesc(B_major)
         
         self.MNK_shape = HyperCube(3, [mma_op.M_tile, mma_op.N_tile, mma_op.K_tile])
-        self.
+        self.thread_id = 
 
 
 def gmma_selector(

@@ -34,6 +34,14 @@ class HyperCube:
         ), "Static dim value should be > 0."
         self.dimensions[key] = value
 
+    def __len__(self):
+        return self.ndim
+
+    def append_and_get(self, v: Union[int, IntegerType]):
+        dimensions = [x for x in self.dimensions] + [v]
+        ret = HyperCube(self.ndim + 1, dimensions)
+        return ret
+
     def dim_is_dynamic(self, key: int):
         return isinstance(self[key], IntegerType)
 
@@ -104,6 +112,9 @@ class HyperPoint:
     def __setitem__(self, key: int, value: Union[int, IntegerType]):
         assert key >= 0 and key < self.ndim
         self.dimensions[key] = value
+
+    def __len__(self):
+        return self.ndim
 
     def dim_is_dynamic(self, key: int):
         return isinstance(self[key], IntegerType)
