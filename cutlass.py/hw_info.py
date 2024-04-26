@@ -3,6 +3,12 @@ import subprocess
 import os
 
 
+WARP_SIZE = 32
+WARP_GROUP_SIZE = 128
+WARP_PER_WARP_GROUP = 4
+MAX_CLUSTER_SIZE = 16
+
+
 @dataclass
 class dim3:
     x: int
