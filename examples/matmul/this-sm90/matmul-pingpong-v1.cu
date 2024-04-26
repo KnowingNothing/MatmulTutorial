@@ -333,6 +333,158 @@ DEVICE void cp_async(void* ptr, const T* gmem_ptr) {
                "l"(gmem_ptr), "n"(16), "r"(16));
 }
 
+// GMMA 64x128x16 F32+=F16*F16
+struct SM90_64x128x16_F32F16F16_SS
+{
+  DEVICE static void
+  wgmma(uint64_t const& desc_a,
+      uint64_t const& desc_b,
+      float         & d00, float         & d01, float         & d02, float         & d03,
+      float         & d04, float         & d05, float         & d06, float         & d07,
+      float         & d08, float         & d09, float         & d10, float         & d11,
+      float         & d12, float         & d13, float         & d14, float         & d15,
+      float         & d16, float         & d17, float         & d18, float         & d19,
+      float         & d20, float         & d21, float         & d22, float         & d23,
+      float         & d24, float         & d25, float         & d26, float         & d27,
+      float         & d28, float         & d29, float         & d30, float         & d31,
+      float         & d32, float         & d33, float         & d34, float         & d35,
+      float         & d36, float         & d37, float         & d38, float         & d39,
+      float         & d40, float         & d41, float         & d42, float         & d43,
+      float         & d44, float         & d45, float         & d46, float         & d47,
+      float         & d48, float         & d49, float         & d50, float         & d51,
+      float         & d52, float         & d53, float         & d54, float         & d55,
+      float         & d56, float         & d57, float         & d58, float         & d59,
+      float         & d60, float         & d61, float         & d62, float         & d63,
+      int const scale_A = 1,
+      int const scale_B = 1,
+      int const scale_D = 1,
+      int const trans_A = 0,
+      int const trans_B = 0)
+  {
+    asm volatile(
+    "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %66, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
+      "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
+      " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
+      " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
+      " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31,  "
+      " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39,  "
+      " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47,  "
+      " %48,  %49,  %50,  %51,  %52,  %53,  %54,  %55,  "
+      " %56,  %57,  %58,  %59,  %60,  %61,  %62,  %63},"
+      " %64,"
+      " %65,"
+      " p,    %67,  %68,  %69,  %70;\n"
+    "}\n"
+      : "+f"(d00), "+f"(d01), "+f"(d02), "+f"(d03),
+        "+f"(d04), "+f"(d05), "+f"(d06), "+f"(d07),
+        "+f"(d08), "+f"(d09), "+f"(d10), "+f"(d11),
+        "+f"(d12), "+f"(d13), "+f"(d14), "+f"(d15),
+        "+f"(d16), "+f"(d17), "+f"(d18), "+f"(d19),
+        "+f"(d20), "+f"(d21), "+f"(d22), "+f"(d23),
+        "+f"(d24), "+f"(d25), "+f"(d26), "+f"(d27),
+        "+f"(d28), "+f"(d29), "+f"(d30), "+f"(d31),
+        "+f"(d32), "+f"(d33), "+f"(d34), "+f"(d35),
+        "+f"(d36), "+f"(d37), "+f"(d38), "+f"(d39),
+        "+f"(d40), "+f"(d41), "+f"(d42), "+f"(d43),
+        "+f"(d44), "+f"(d45), "+f"(d46), "+f"(d47),
+        "+f"(d48), "+f"(d49), "+f"(d50), "+f"(d51),
+        "+f"(d52), "+f"(d53), "+f"(d54), "+f"(d55),
+        "+f"(d56), "+f"(d57), "+f"(d58), "+f"(d59),
+        "+f"(d60), "+f"(d61), "+f"(d62), "+f"(d63)
+      :  "l"(desc_a),
+         "l"(desc_b),
+         "r"(int32_t(scale_D)), "n"(int32_t(scale_A)), "n"(int32_t(scale_B)), "n"(int32_t(trans_A)), "n"(int32_t(trans_B)));
+  }
+};
+
+template <typename T>
+DEVICE void warpgroup_fence_operand(T &reg) {
+  asm volatile("" : "+r"(reg)::"memory");
+}
+
+DEVICE
+void warpgroup_arrive() {
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
+
+DEVICE
+void warpgroup_commit_batch() {
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+
+template <int N> 
+DEVICE void warpgroup_wait() {
+  static_assert(N >= 0 && N <= 7, "WGMMA wait: N must be in range [0, 7]");
+  asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
+}
+
+union GmmaDescriptor {
+
+  HOST_DEVICE constexpr GmmaDescriptor() noexcept : desc_(0) {}
+  HOST_DEVICE constexpr GmmaDescriptor(uint64_t desc) noexcept : desc_(desc) {}
+  HOST_DEVICE constexpr GmmaDescriptor(GmmaDescriptor const &t) noexcept
+      : desc_(t.desc_) {}
+  HOST_DEVICE constexpr GmmaDescriptor(GmmaDescriptor &&t) noexcept
+      : desc_(t.desc_) {}
+
+  HOST_DEVICE constexpr GmmaDescriptor &
+  operator=(GmmaDescriptor const &t) noexcept {
+    desc_ = t.desc_;
+    return *this;
+  }
+
+  HOST_DEVICE constexpr GmmaDescriptor &operator=(GmmaDescriptor &&t) noexcept {
+    desc_ = t.desc_;
+    return *this;
+  }
+
+  uint64_t desc_;
+  uint32_t reg32_[2];
+  uint16_t reg16_[4];
+
+  // Bitfield implementation avoids the need for shifts in assignment
+  struct {
+    // start_address, bit [0,14), 4LSB not included
+    uint16_t start_address_ : 14, : 2; // 14 bits [0,14), 2 bits unused
+    // leading dimension byte offset, bit [16,30), 4LSB not included
+    // For N: This is the stride from the first col to the second col of the 8x2
+    // brick in INTERLEAVED
+    //   Unused for all SWIZZLE_* layouts (and assumed to be 1)
+    // For T: This is the stride from the first 8 rows to the next 8 rows.
+    uint16_t leading_byte_offset_ : 14, : 2; // 14 bits [0,14), 2 bits unused
+    // stride dimension byte offset, bit [32,46), 4LSB not included
+    // For N: This is the stride from the first 8 rows to the next 8 rows.
+    // For T: This is the stride fro mthe first 8 cols to the next 8 cols.
+    uint16_t stride_byte_offset_ : 14, : 2; // 14 bits [0,14), 2 bits unused
+    // base_offset, bit [49,52)
+    // Valid only for SWIZZLE_128B and SWIZZLE_64B
+    uint8_t : 1,
+        base_offset_ : 3, : 4; // 1 bit unused, 3 bits [1,4), 4 bits unused
+    // layout type, bit [62,64)
+    // SWIZZLE_NONE = 0, SWIZZLE_32B = 3, SWIZZLE_64B = 2, SWIZZLE_128B = 1
+    uint8_t : 6, layout_type_ : 2; // 6 bits unused, 2 bits [6,8)
+  } bitfield;
+
+  // Decay to a uint64_t
+  HOST_DEVICE constexpr operator uint64_t() const noexcept { return desc_; }
+};
+
+/// make shared memory descriptor
+template <class PointerType>
+DEVICE GmmaDescriptor make_smem_desc(PointerType smem_ptr) {
+  GmmaDescriptor desc;
+  uint32_t uint_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  desc.bitfield.start_address_ = uint_ptr >> 4;
+  desc.bitfield.layout_type_ = 0;          /// no swizzle
+  desc.bitfield.leading_byte_offset_ = 8; /// 8 bytes
+  desc.bitfield.stride_byte_offset_ = 16;   /// 16 bytes
+  /// base_offset_ is not valid for non-swizzle
+  return desc;
+}
+
 }  // namespace utils
 
 // Cluster-wide barrier. CUDA barrier doesn't support cluster scope. Have to
@@ -799,6 +951,102 @@ struct EpilogueLoadPipeline {
   }
 };
 
+
+template <typename AType, typename BType, typename AccumType, int MTile, int NTile, int KTile>
+struct WgMMA;
+
+template <int MTile, int NTile, int KTile>
+struct WgMMA<half_t, half_t, float, MTile, NTile, KTile> {
+  static constexpr int elements_per_thread = 2;
+  static constexpr int threads_per_row = 4;
+  static constexpr int threads_per_col = WARP_SIZE / threads_per_row;
+  static constexpr int warp_elements_per_row = elements_per_thread * threads_per_row;
+  static constexpr int warp_repeats_per_row = NTile / warp_elements_per_row;
+  static constexpr int warp_repeats_per_col = 2;
+  static constexpr int num_warps = WARP_NUMBER_IN_WARP_GROUP;
+  static constexpr int WGMMA_M = 64;
+  static constexpr int WGMMA_K = 16;
+  static constexpr int num_warp_groups_m = BlockM / WGMMA_M;
+  static constexpr int k_iter = KTile / WGMMA_K;
+
+  static constexpr int num_elements_accumulators = num_warp_groups_m * warp_repeats_per_row * warp_repeats_per_col * elements_per_thread;
+
+  DEVICE WgMMA () {
+    PRINT_BT(0, 0, 0, "Use WgMMA: MTile=%d, NTile=%d, KTile=%d\n", MTile, NTile, KTile);
+    PRINT_BT(0, 0, 0, "warp_repeats_per_row=%d\n", warp_repeats_per_row);
+    PRINT_BT(0, 0, 0, "warp_repeats_per_col=%d\n", warp_repeats_per_col);
+    PRINT_BT(0, 0, 0, "elements_per_thread=%d\n", elements_per_thread);
+  }
+
+  DEVICE static void get_m_n_idx_fragment(int& m, int& n, int thread_id, int k_wgmma, int row_id, int col_id, int item_id) {
+    int warp_id = thread_id / WARP_SIZE;
+    int lane_id = thread_id % WARP_SIZE;
+    m = k_wgmma * WGMMA_M + warp_id * threads_per_col * warp_repeats_per_col + row_id * threads_per_col;
+    n = col_id * warp_elements_per_row + lane_id * elements_per_thread + item_id;
+  }
+
+  DEVICE static void wgmma(
+      half_t* smem_A,
+      half_t* smem_B,
+      float* accum,
+      int const scale_A = 1,
+      int const scale_B = 1,
+      int const scale_D = 1,
+      int const trans_A = 0,
+      int const trans_B = 0
+  ) {
+      float         & d00, float         & d01, float         & d02, float         & d03,
+      float         & d04, float         & d05, float         & d06, float         & d07,
+      float         & d08, float         & d09, float         & d10, float         & d11,
+      float         & d12, float         & d13, float         & d14, float         & d15,
+      float         & d16, float         & d17, float         & d18, float         & d19,
+      float         & d20, float         & d21, float         & d22, float         & d23,
+      float         & d24, float         & d25, float         & d26, float         & d27,
+      float         & d28, float         & d29, float         & d30, float         & d31,
+      float         & d32, float         & d33, float         & d34, float         & d35,
+      float         & d36, float         & d37, float         & d38, float         & d39,
+      float         & d40, float         & d41, float         & d42, float         & d43,
+      float         & d44, float         & d45, float         & d46, float         & d47,
+      float         & d48, float         & d49, float         & d50, float         & d51,
+      float         & d52, float         & d53, float         & d54, float         & d55,
+      float         & d56, float         & d57, float         & d58, float         & d59,
+      float         & d60, float         & d61, float         & d62, float         & d63,
+
+    float* accum_ = accum;
+    for (int k = 0; k < k_iter; ++k) {
+      accum = accum_;
+      auto desc_b = make_smem_desc(smem_B + k * )
+      for (int m = 0; m < num_warp_groups_m; ++m) {
+        accum = accum + m * (num_elements_accumulators / num_warp_groups_m);
+        auto desc_a = make_smem_desc(smem_A);
+        SM90_64x128x16_F32F16F16_SS::wgmma(
+          desc_a, desc_b,
+          accum[0], accum[1], accum[2], accum[3],
+          accum[4], accum[5], accum[6], accum[7],
+          accum[8], accum[9], accum[10], accum[11],
+          accum[12], accum[13], accum[14], accum[15],
+          accum[16], accum[17], accum[18], accum[19],
+          accum[20], accum[21], accum[22], accum[23],
+          accum[24], accum[25], accum[26], accum[27],
+          accum[28], accum[29], accum[30], accum[31],
+          accum[32], accum[33], accum[34], accum[35],
+          accum[36], accum[37], accum[38], accum[39],
+          accum[40], accum[41], accum[42], accum[43],
+          accum[44], accum[45], accum[46], accum[47],
+          accum[48], accum[49], accum[50], accum[51],
+          accum[52], accum[53], accum[54], accum[55],
+          accum[56], accum[57], accum[58], accum[59],
+          accum[60], accum[61], accum[62], accum[63],
+          sacle_A, scale_B,
+          scale_D,
+          trans_A, trans_B
+        );
+      }
+    }
+  }
+
+};
+
 // A simpilified tile scheduler that always takes AlongN and non swizzle
 template <int BlockM, int BlockN, int ClusterM, int ClusterN>
 struct TileScheduler {
@@ -874,14 +1122,16 @@ struct Mainloop {
     utils::prefetch_tma_descriptor(tensormap_b);
   }
 
-  DEVICE void load(const utils::TmaDescriptor& tensormap_a,
+  DEVICE void load(
+    const utils::TmaDescriptor& tensormap_a,
                    const utils::TmaDescriptor& tensormap_b,
                    TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline,
                    PipelineState<Stages> mainloop_pipeline_state, int m_idx,
                    int n_idx, int k_tile_count, uint32_t block_rank_in_cluster,
                    MainloopSharedStorage<AType, BType, CType, AccumType, BlockM,
                                          BlockN, BlockK, ClusterM, ClusterN,
-                                         Stages>& shared_storage) {
+                                         Stages>& shared_storage
+  ) {
     int warp_idx = threadIdx.x / WARP_SIZE;
     int warp_idx_in_warp_group = warp_idx % 4;
     int lane_predicate = elect_one_sync();
@@ -953,6 +1203,8 @@ struct Mainloop {
         // this moves to next stage, but doesn't affect the outer state
         // because this state is passed by copy, not reference.
         ++mainloop_pipeline_state;
+
+        PRINT_B(0, 0, "TMA load at stage %d issued\n", mainloop_pipeline_state.index);
       }
     }
   }
@@ -967,6 +1219,31 @@ struct Mainloop {
     if (warp_idx_in_warp_group == 0 && lane_predicate == 1) {
       mainloop_pipeline.producer_tail(mainloop_pipeline_state);
     }
+  }
+
+  template<typename WGMMA>
+  DEVICE void mma(
+    TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline,
+    PipelineState<Stages> mainloop_pipeline_state,
+    WGMMA wgmma,
+    AccumType* accum,
+    int k_tile_count,
+    int thread_idx,
+    MainloopSharedStorage<AType, BType, CType, AccumType, BlockM,
+    BlockN, BlockK, ClusterM, ClusterN,
+    Stages>& shared_tensors
+  ) {
+
+    for (int i = 0; i < WGMMA::num_elements_accumulators; ++i) {
+      warpgroup_fence_operand(accum[i]);
+    }
+
+    auto barrier_token = mainloop_pipeline.consumer_try_wait(mainloop_pipeline_state);
+    mainloop_pipeline.consuemr_wait(mainloop_pipeline_state, barrier_token);
+
+    int read_stage = mainloop_pipeline_state.index;
+    warpgroup_arrive();
+
   }
 };
 
@@ -1060,8 +1337,6 @@ __global__ void gpu_gemm_kernel(
   auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
   int lane_predicate = elect_one_sync();
 
-  PRINT_BT(0, 0, 0, "1\n");
-
   // only the first thread in a block launch tma prefetch
   if ((warp_idx == 0) && lane_predicate) {
     Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
@@ -1072,7 +1347,7 @@ __global__ void gpu_gemm_kernel(
                                                         &tensormap_b);
   }
 
-  PRINT_BT(0, 0, 0, "2\n");
+  PRINT_BT(0, 0, 0, "TMA prefetch issued\n");
 
   // mainloop pipeline
   TmaPipelineParams<Stages> mainloop_pipeline_params;
@@ -1117,6 +1392,9 @@ __global__ void gpu_gemm_kernel(
   Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
            ClusterN, Stages>
       mainloop;
+  
+  
+  WgMMA<AType, BType, AccumType, WGMMA_M, BlockN, WGMMA_K> wgmma;
 
   auto cluster_wait_fn = [&]() {
     if constexpr (ClusterM * ClusterN > 1) {
@@ -1127,8 +1405,6 @@ __global__ void gpu_gemm_kernel(
       return []() {};
     }
   }();
-
-  PRINT_BT(0, 0, 0, "3\n");
 
   TileScheduler<BlockM, BlockN, ClusterM, ClusterN> scheduler(
       kernel_params.gemm_params.M, kernel_params.gemm_params.N);
@@ -1143,7 +1419,7 @@ __global__ void gpu_gemm_kernel(
 
   cluster_wait_fn();
 
-  PRINT_BT(0, 0, 0, "4\n");
+  PRINT_BT(0, 0, 0, "Ready to enter producer-consuemr loop\n");
 
   if (warp_group_role == WarpGroupRole::Producer) {
     // you can't only dealloc without alloc in consumer!
@@ -1179,6 +1455,22 @@ __global__ void gpu_gemm_kernel(
     // you can't only alloc without dealloc in producer!
     // Don't know why the magic number 232
     // utils::warpgroup_reg_alloc<232>();
+
+    while (work_tile_info.valid) {
+      AccumType accumulators[WgMMA<AType, BType, AccumType, BlockM, BlockN, BlockK>::num_elements_accumulators];
+      
+      // consuemr 0 doens't block at the first wait
+      math_wg_order.wait();
+
+      mainloop.mma(
+        mainloop_pipeline,
+        mainloop_pipeline_consumer_state,
+        accumulators,
+        k_tile_count,
+        warp_group_thread_idx,
+        shared_storage.mainloop
+      );
+    }
   }
 }
 
