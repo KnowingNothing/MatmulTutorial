@@ -1100,7 +1100,7 @@ template <class AType, class BType, class CType, class AccumType, int BlockM,
 struct Mainloop {
   static_assert(std::is_same<AType, BType>::value);
   static constexpr uint32_t TmaTransactionBytes =
-      (BlockM + BlockN) * BlockK * Stages * sizeof(AType);
+      BlockM * BlockK * sizeof(AType) + BlockN * BlockK * sizeof(BType);
 
   DEVICE static void prefetch_tma_descriptor(
       const utils::TmaDescriptor* tensormap_a,
@@ -1186,7 +1186,8 @@ struct Mainloop {
         }
 
         // PRINT_B(0, 0, "TMA load at stage %d issued\n",
-                // mainloop_pipeline_state.index);
+        //         mainloop_pipeline_state.index);
+        // PRINT_B(0, 0, "TMA load bytes %d\n", mainloop_pipeline.params.transaction_bytes);
 
         // this moves to next stage, but doesn't affect the outer state
         // because this state is passed by copy, not reference.
@@ -1221,9 +1222,13 @@ struct Mainloop {
       utils::warpgroup_fence_operand(accum[i]);
     }
 
+    PRINT_BT(0, 0, 128, "hi\n");
+
     auto barrier_token =
         mainloop_pipeline.consumer_try_wait(mainloop_pipeline_state);
     mainloop_pipeline.consumer_wait(mainloop_pipeline_state, barrier_token);
+
+    PRINT_BT(0, 0, 128, "here\n");
 
     int read_stage = mainloop_pipeline_state.index;
     utils::warpgroup_arrive();
@@ -1244,10 +1249,14 @@ struct Mainloop {
       utils::warpgroup_fence_operand(accum[i]);
     }
 
+    PRINT_BT(0, 0, 128, "1\n");
+
     // PRINT_BT(0, 0, 0, "issue the first wgmma at stage %d\n", read_stage);
 
     // start from 1 because the first wgmma was done
     for (;  k_tile_count > 1; --k_tile_count) {
+
+      PRINT_BT(0, 0, 128, "work\n");
       auto barrier_token =
           mainloop_pipeline.consumer_try_wait(mainloop_pipeline_state);
       mainloop_pipeline.consumer_wait(mainloop_pipeline_state, barrier_token);
@@ -1282,9 +1291,19 @@ struct Mainloop {
       ++mainloop_pipeline_state_release;
     }
 
+    PRINT_BT(0, 0, 128, "2\n");
+
     for (int i = 0; i < WGMMA::num_elements_accumulators; ++i) {
       utils::warpgroup_fence_operand(accum[i]);
     }
+  }
+
+  DEVICE void mma_tail(TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline, PipelineState<Stages> mainloop_pipeline_state, int k_tile_count) {
+    mainloop_pipeline_state.advance(k_tile_count);
+    utils::warpgroup_wait<0>();
+
+    mainloop_pipeline.consumer_release(mainloop_pipeline_state);
+    ++mainloop_pipeline_state;
   }
 };
 
@@ -1507,6 +1526,9 @@ __global__ void gpu_gemm_kernel(
                    accumulators, k_tile_count, shared_storage.mainloop);
 
       math_wg_order.arrive();
+
+      mainloop.mma_tail(mainloop_pipeline, mainloop_pipeline_consumer_state, k_tile_count);
+      mainloop_pipeline_consumer_state.advance(k_tile_count * 2);
 
       math_wg_order.wait();
 
