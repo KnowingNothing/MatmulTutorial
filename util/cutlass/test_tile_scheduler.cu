@@ -11,7 +11,7 @@ using namespace cute;
 
 using Scheduler = PersistentTileSchedulerSm90;
 
-/// nvcc -arch=sm_90a -I ../../include -I /home/jshao/zhengsz/cutlass/include -lcuda -std=c++17 test_tile_scheduler.cu -o test
+/// nvcc -arch=sm_90a -I ../../include -I /home/horus/cutlass/include -lcuda -std=c++17 test_tile_scheduler.cu -o test
 
 struct KernelSharedStorage {
 
@@ -36,6 +36,9 @@ __global__ void test_kernel(KernelParams params) {
     }
     if (threadIdx.x == 0) {
         printf("block %d maps to linear m %d n %d\n", blockIdx.x, tileinfo.M_idx, tileinfo.N_idx);
+        int idx = blockIdx.y * 2 + blockIdx.x;
+        params.idx[idx * 2] = tileinfo.M_idx;
+        params.idx[idx * 2 + 1] = tileinfo.N_idx; 
     }
 }
 
@@ -43,7 +46,7 @@ int main() {
     const int M = 4096;
     const int N = 4096;
     const int K = 4096;
-    dim3 grid(SM_NUMBER, 1, 1);
+    dim3 grid(2, 66, 1);
     dim3 block(WARP_GROUP_SIZE * WG_NUMBER, 1, 1);
     const int CLUSTER_M = 2;
     const int CLUSTER_N = 1;
@@ -52,8 +55,8 @@ int main() {
     void const *kernel =
         (void const *)test_kernel;
 
-    auto idx = alloc_cpu_tensor<int>({(int)block.x});
-    auto g_idx = alloc_gpu_tensor<int>({(int)block.x});
+    auto idx = alloc_cpu_tensor<int>({(int)block.x * 2});
+    auto g_idx = alloc_gpu_tensor<int>({(int)block.x * 2});
 
     using ShapeMNKL = Shape<int, int, int, int>;
     ShapeMNKL shape{M, N, K, 1};
@@ -62,7 +65,7 @@ int main() {
     using ClusterShape = Shape<_2, _1, _1>;
     ClusterShape cluster_shape{};
     KernelHardwareInfo info{};
-    Scheduler::Arguments args{};
+    Scheduler::Arguments args{1};
     Scheduler::Params schedule_params = Scheduler::to_underlying_arguments(shape, tile_shape, cluster_shape, info, args);
 
     KernelParams params{M, N, K, schedule_params, g_idx};
@@ -87,7 +90,14 @@ int main() {
     cudaError_t launch_result = cudaGetLastError();
     CUDA_CHECK(launch_result);
 
-    copy_to_cpu(idx, g_idx, {(int)block.x});
+    copy_to_cpu(idx, g_idx, {(int)block.x * 2});
+
+    for (int j = 0; j < grid.y; ++j) {
+        for (int i = 0; i < grid.x; ++i) {
+            int x = j * 2 + i;
+            std::cout << "blockIdx(" << i << "," << j << ")" << " -> (" << idx[x * 2] << "," << idx[x*2+1] << ")\n"; 
+        }
+    }
 
     return 0;
 }
