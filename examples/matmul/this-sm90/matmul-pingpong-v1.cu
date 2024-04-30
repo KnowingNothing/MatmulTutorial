@@ -1,9 +1,9 @@
 #include "common.h"
 #include "reference.h"
 
-const int testM = 4096;
+const int testM = 5120;
 const int testN = 4096;
-const int testK = 4096;
+const int testK = 2048;
 const int iters = 100;
 static constexpr int CLUSTER_M = 2;
 static constexpr int CLUSTER_N = 1;
@@ -957,7 +957,8 @@ struct WgMMA<half_t, half_t, float, MTile, NTile, KTile> {
       elements_per_thread;
 
   DEVICE WgMMA() {
-    // PRINT_BT(0, 0, 0, "Use WgMMA: MTile=%d, NTile=%d, KTile=%d\n", MTile, NTile,
+    // PRINT_BT(0, 0, 0, "Use WgMMA: MTile=%d, NTile=%d, KTile=%d\n", MTile,
+    // NTile,
     //          KTile);
     // PRINT_BT(0, 0, 0, "warp_repeats_per_row=%d\n", warp_repeats_per_row);
     // PRINT_BT(0, 0, 0, "warp_repeats_per_col=%d\n", warp_repeats_per_col);
@@ -970,9 +971,19 @@ struct WgMMA<half_t, half_t, float, MTile, NTile, KTile> {
     int warp_id = thread_id / WARP_SIZE;
     int lane_id = thread_id % WARP_SIZE;
     m = k_wgmma * WGMMA_M + warp_id * threads_per_col * warp_repeats_per_col +
-        row_id * threads_per_col;
-    n = col_id * warp_elements_per_row + lane_id * elements_per_thread +
-        item_id;
+        row_id * threads_per_col + lane_id / threads_per_row;
+    n = col_id * warp_elements_per_row +
+        lane_id % threads_per_row * elements_per_thread + item_id;
+  }
+
+  DEVICE static void get_4d_idx_from_linear(int& k_wgmma, int& row_id,
+                                            int& col_id, int& item_id,
+                                            int linear_id) {
+    item_id = linear_id % elements_per_thread;
+    row_id = linear_id / elements_per_thread % warp_repeats_per_col;
+    col_id = linear_id / elements_per_thread / warp_repeats_per_col %
+             warp_repeats_per_row;
+    k_wgmma = linear_id / (num_elements_accumulators / num_warp_groups_m);
   }
 
   template <int ScaleA, int ScaleB, int ScaleD, int TransA, int TransB>
@@ -1011,7 +1022,6 @@ struct WgMMA<half_t, half_t, float, MTile, NTile, KTile> {
       accum = accum_;
       auto desc_b = utils::make_smem_desc(smem_B + k * WGMMA_K);
       for (int m = 0; m < num_warp_groups_m; ++m) {
-        accum = accum + m * (num_elements_accumulators / num_warp_groups_m);
         auto desc_a =
             utils::make_smem_desc(smem_A + k * WGMMA_K + m * WGMMA_M * KTile);
         // the remaining must be ScaleD = 1
@@ -1029,6 +1039,7 @@ struct WgMMA<half_t, half_t, float, MTile, NTile, KTile> {
                   accum[50], accum[51], accum[52], accum[53], accum[54],
                   accum[55], accum[56], accum[57], accum[58], accum[59],
                   accum[60], accum[61], accum[62], accum[63]);
+        accum = accum + (num_elements_accumulators / num_warp_groups_m);
       }
     }
   }
@@ -1143,14 +1154,18 @@ struct Mainloop {
         }
       }
 
+      // PRINT_B(1, 0, "mcast_mask_b=%d, stride_b=%d, block_id_x=%d\n",
+      // mcast_mask_b, multicast_stride_b, block_id_x_in_cluster);
+
       for (int i = 0; i < k_tile_count; ++i) {
+        // PRINT_B(0, 0, "producer acuquire stage %d phase %d\n",
+        // mainloop_pipeline_state.index, mainloop_pipeline_state.phase);
         mainloop_pipeline.producer_acquire(mainloop_pipeline_state);
+        // PRINT_B(0, 0, "get!");
 
         int stage = mainloop_pipeline_state.index;
-        void* smem_ptr_A = reinterpret_cast<void*>(shared_storage.smem_A +
-                                                   stage * BlockM * BlockK);
-        void* smem_ptr_B = reinterpret_cast<void*>(shared_storage.smem_B +
-                                                   stage * BlockN * BlockK);
+        AType* smem_ptr_A = (shared_storage.smem_A + stage * BlockM * BlockK);
+        BType* smem_ptr_B = (shared_storage.smem_B + stage * BlockN * BlockK);
 
         // load A and B using the same barrier
         if constexpr (ClusterN > 1) {
@@ -1158,7 +1173,10 @@ struct Mainloop {
           utils::tma_copy_3d_multicast(
               &tensormap_a,
               *mainloop_pipeline.producer_get_barrier(mainloop_pipeline_state),
-              mcast_mask_a, smem_ptr_A,
+              mcast_mask_a,
+              reinterpret_cast<void*>(smem_ptr_A + block_id_y_in_cluster *
+                                                       multicast_stride_a *
+                                                       BlockK),
               i * BlockK,  // innermost dim moves fastest
               m_idx * BlockM + block_id_y_in_cluster * multicast_stride_a, 0);
         } else {
@@ -1174,9 +1192,14 @@ struct Mainloop {
           utils::tma_copy_3d_multicast(
               &tensormap_b,
               *mainloop_pipeline.producer_get_barrier(mainloop_pipeline_state),
-              mcast_mask_b, smem_ptr_B,
+              mcast_mask_b,
+              reinterpret_cast<void*>(smem_ptr_B + block_id_x_in_cluster *
+                                                       multicast_stride_b *
+                                                       BlockK),
               i * BlockK,  // innermost dim moves fastest
               n_idx * BlockN + block_id_x_in_cluster * multicast_stride_b, 0);
+          // PRINT_B(0, 0, "crd0=%d, crd1=%d\n", i * BlockK, n_idx * BlockN +
+          // block_id_x_in_cluster * multicast_stride_b);
         } else {
           // normal copy B
           utils::tma_copy_3d(
@@ -1187,7 +1210,8 @@ struct Mainloop {
 
         // PRINT_B(0, 0, "TMA load at stage %d issued\n",
         //         mainloop_pipeline_state.index);
-        // PRINT_B(0, 0, "TMA load bytes %d\n", mainloop_pipeline.params.transaction_bytes);
+        // PRINT_B(0, 0, "TMA load bytes %d\n",
+        // mainloop_pipeline.params.transaction_bytes);
 
         // this moves to next stage, but doesn't affect the outer state
         // because this state is passed by copy, not reference.
@@ -1222,13 +1246,13 @@ struct Mainloop {
       utils::warpgroup_fence_operand(accum[i]);
     }
 
-    PRINT_BT(0, 0, 128, "hi\n");
+    // PRINT_BT(0, 0, 128, "hi\n");
 
     auto barrier_token =
         mainloop_pipeline.consumer_try_wait(mainloop_pipeline_state);
     mainloop_pipeline.consumer_wait(mainloop_pipeline_state, barrier_token);
 
-    PRINT_BT(0, 0, 128, "here\n");
+    // PRINT_BT(0, 0, 128, "here\n");
 
     int read_stage = mainloop_pipeline_state.index;
     utils::warpgroup_arrive();
@@ -1249,14 +1273,13 @@ struct Mainloop {
       utils::warpgroup_fence_operand(accum[i]);
     }
 
-    PRINT_BT(0, 0, 128, "1\n");
+    // PRINT_BT(0, 0, 128, "1\n");
 
     // PRINT_BT(0, 0, 0, "issue the first wgmma at stage %d\n", read_stage);
 
     // start from 1 because the first wgmma was done
-    for (;  k_tile_count > 1; --k_tile_count) {
-
-      PRINT_BT(0, 0, 128, "work\n");
+    for (; k_tile_count > 1; --k_tile_count) {
+      // PRINT_BT(0, 0, 128, "work\n");
       auto barrier_token =
           mainloop_pipeline.consumer_try_wait(mainloop_pipeline_state);
       mainloop_pipeline.consumer_wait(mainloop_pipeline_state, barrier_token);
@@ -1285,21 +1308,24 @@ struct Mainloop {
 
       mainloop_pipeline.consumer_release(mainloop_pipeline_state_release);
 
-      // PRINT_BT(0, 0, 128, "release pipeline at stage %d\n", mainloop_pipeline_state_release.index);
+      // PRINT_BT(0, 0, 128, "release pipeline at stage %d\n",
+      // mainloop_pipeline_state_release.index);
 
       ++mainloop_pipeline_state;
       ++mainloop_pipeline_state_release;
     }
 
-    PRINT_BT(0, 0, 128, "2\n");
+    // PRINT_BT(0, 0, 128, "2\n");
 
     for (int i = 0; i < WGMMA::num_elements_accumulators; ++i) {
       utils::warpgroup_fence_operand(accum[i]);
     }
   }
 
-  DEVICE void mma_tail(TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline, PipelineState<Stages> mainloop_pipeline_state, int k_tile_count) {
-    mainloop_pipeline_state.advance(k_tile_count);
+  DEVICE void mma_tail(
+      TmaPipeline<Stages, ClusterM, ClusterN> mainloop_pipeline,
+      PipelineState<Stages> mainloop_pipeline_state, int k_tile_count) {
+    mainloop_pipeline_state.advance(k_tile_count - 1);
     utils::warpgroup_wait<0>();
 
     mainloop_pipeline.consumer_release(mainloop_pipeline_state);
@@ -1321,6 +1347,25 @@ struct Epilogue {
   DEVICE static void prefetch_tma_descriptor(
       [[maybe_unused]] const utils::TmaDescriptor* tensormap_a,
       [[maybe_unused]] const utils::TmaDescriptor* tensormap_b) {}
+
+  template <typename WGMMA>
+  DEVICE void store(CType* dst, WGMMA wgmma, AccumType* accum, int m_idx,
+                    int n_idx, int M, int N) {
+    // this store is specialized for WgMMA M64NnK16
+    int m = m_idx * BlockM;
+    int n = n_idx * BlockN;
+
+    for (int i = 0; i < WGMMA::num_elements_accumulators; ++i) {
+      AccumType value = accum[i];
+      int m_frag, n_frag, k_wgmma, row_id, col_id, item_id;
+      WGMMA::get_4d_idx_from_linear(k_wgmma, row_id, col_id, item_id, i);
+      WGMMA::get_m_n_idx_fragment(m_frag, n_frag, threadIdx.x % WARP_GROUP_SIZE,
+                                  k_wgmma, row_id, col_id, item_id);
+      if ((m + m_frag < M) && (n + n_frag < N)) {
+        dst[(m + m_frag) * N + (n + n_frag)] = (CType)value;
+      }
+    }
+  }
 };
 
 using LoadWarpOrderBarrier = OrderedBarrier<1, 2>;
@@ -1454,6 +1499,9 @@ __global__ void gpu_gemm_kernel(
       mainloop;
 
   WgMMA<AType, BType, AccumType, BlockM, BlockN, BlockK> wgmma;
+  Epilogue<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+           ClusterN, Stages>
+      epilogue;
 
   auto cluster_wait_fn = [&]() {
     if constexpr (ClusterM * ClusterN > 1) {
@@ -1488,10 +1536,14 @@ __global__ void gpu_gemm_kernel(
     if (producer_warp_role == ProducerWarpRole::Mainloop) {
       bool first_arrive = true;
       while (work_tile_info.valid) {
+        // PRINT_BT(0, 0, 0, "current m=%d, n=%d\n", work_tile_info.m_idx,
+        // work_tile_info.n_idx);
         mainloop.load(tensormap_a, tensormap_b, mainloop_pipeline,
                       mainloop_pipeline_producer_state, work_tile_info.m_idx,
                       work_tile_info.n_idx, k_tile_count, block_idx_in_cluster,
                       shared_storage.mainloop);
+
+        // PRINT_BT(0, 0, 0, "done!\n");
 
         mainloop_pipeline_producer_state.advance(k_tile_count);
         if (first_arrive) {
@@ -1516,6 +1568,8 @@ __global__ void gpu_gemm_kernel(
     utils::warpgroup_reg_alloc<232>();
 
     while (work_tile_info.valid) {
+      // PRINT_BT(0, 0, 128, "current m=%d, n=%d\n", work_tile_info.m_idx,
+      // work_tile_info.n_idx);
       AccumType accumulators[WgMMA<AType, BType, AccumType, BlockM, BlockN,
                                    BlockK>::num_elements_accumulators];
 
@@ -1525,28 +1579,44 @@ __global__ void gpu_gemm_kernel(
       mainloop.mma(mainloop_pipeline, mainloop_pipeline_consumer_state, wgmma,
                    accumulators, k_tile_count, shared_storage.mainloop);
 
+      // PRINT_BT(0, 0, 128, "done mma!\n");
+
       math_wg_order.arrive();
 
-      mainloop.mma_tail(mainloop_pipeline, mainloop_pipeline_consumer_state, k_tile_count);
+      mainloop.mma_tail(mainloop_pipeline, mainloop_pipeline_consumer_state,
+                        k_tile_count);
       mainloop_pipeline_consumer_state.advance(k_tile_count * 2);
+
+      // PRINT_BT(0, 0, 128, "done mma_tail!\n");
 
       math_wg_order.wait();
 
+      epilogue.store(kernel_params.gemm_params.C, wgmma, accumulators,
+                     work_tile_info.m_idx, work_tile_info.n_idx,
+                     kernel_params.gemm_params.M, kernel_params.gemm_params.N);
+
       math_wg_order.arrive();
 
-      scheduler.advance();
+      // do nothing for epilogue store tail
+
+      // PRINT_BT(0, 0, 128, "done!\n");
+
+      scheduler.advance(2);
       work_tile_info = scheduler.get_current_work_info();
     }
   }
 }
 
 template <class AType, class BType, class CType, class AccumType>
-void gpu_gemm(GemmParams<AType, BType, CType, AccumType> gemm_params) {
+void gpu_gemm(GemmParams<AType, BType, CType, AccumType> gemm_params,
+              bool verbose = true) {
   int sm_number = get_sm_count();
   dim3 grid(CLUSTER_M * CLUSTER_N, sm_number / (CLUSTER_M * CLUSTER_N), 1);
   dim3 block(WARP_GROUP_SIZE * WG_NUMBER, 1, 1);
   dim3 cluster(CLUSTER_M, CLUSTER_N, 1);
-  std::cout << "sm_number: " << sm_number << "\n";
+  if (verbose) {
+    std::cout << "sm_number: " << sm_number << "\n";
+  }
   auto* Kernel = gpu_gemm_kernel<AType, BType, CType, AccumType, BLOCKM, BLOCKN,
                                  BLOCKK, CLUSTER_M, CLUSTER_N, STAGES>;
   size_t smemSizeBytes =
@@ -1557,10 +1627,13 @@ void gpu_gemm(GemmParams<AType, BType, CType, AccumType> gemm_params) {
         Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemSizeBytes);
     CUDA_CHECK(result);
   }
-  std::cout << "Launching kernel with grid " << grid.x << " " << grid.y << " "
-            << grid.z << " and block " << block.x << " " << block.y << " "
-            << block.z << " and cluster " << cluster.x << " " << cluster.y
-            << " " << cluster.z << " and smem " << smemSizeBytes << " bytes\n";
+  if (verbose) {
+    std::cout << "Launching kernel with grid " << grid.x << " " << grid.y << " "
+              << grid.z << " and block " << block.x << " " << block.y << " "
+              << block.z << " and cluster " << cluster.x << " " << cluster.y
+              << " " << cluster.z << " and smem " << smemSizeBytes
+              << " bytes\n";
+  }
   void const* kernel = (void const*)Kernel;
 
   cudaError_t status = cudaFuncSetAttribute(
@@ -1613,18 +1686,21 @@ int main(int argc, char** argv) {
   using BType = half_t;
   using CType = half_t;
   using AccumType = float;
-  AccumType alpha = 0.9;
-  AccumType beta = 0.1;
+  AccumType alpha = 1.0;
+  AccumType beta = 0.0;
 
   std::vector<int> AShape = {M, K};
   std::vector<int> BShape = {N, K};
   std::vector<int> CShape = {M, N};
   auto hA = alloc_cpu_tensor<AType>(AShape);
   random_fill(hA, AShape);
+  // constant_fill(hA, AShape, (AType)1.0);
   auto hB = alloc_cpu_tensor<BType>(BShape);
   random_fill(hB, BShape);
+  // constant_fill(hB, BShape, (BType)1.0);
   auto hC = alloc_cpu_tensor<CType>(CShape);
   random_fill(hC, CShape);
+  // constant_fill(hC, CShape, (CType)(-13.0));
   auto goldenC = alloc_cpu_tensor<CType>(CShape);
   random_fill(goldenC, CShape);
   auto dA = alloc_gpu_tensor<AType>(AShape);
@@ -1675,7 +1751,7 @@ int main(int argc, char** argv) {
   std::cout << "Copying results done!\n";
 
   /// compare results
-  assert_allclose(hC, goldenC, CShape, /*rtol=*/1e-3);
+  assert_allclose(hC, goldenC, CShape, /*rtol=*/1e-3, /*dump=*/false);
   std::cout << "Correct!\n";
 
   /// profile
@@ -1683,12 +1759,16 @@ int main(int argc, char** argv) {
   gpu_timer.sync_all();
   gpu_timer.tick();
   for (int i = 0; i < iters; ++i) {
-    gpu_gemm(gpu_params);
+    gpu_gemm(gpu_params, /*verbose=*/false);
   }
   gpu_timer.tick();
   gpu_timer.sync_all();
-  std::cout << "Profile done! Average latency is "
-            << gpu_timer.report_last_ms() / float(iters) << " ms.\n";
+  float latency = gpu_timer.report_last_ms() / float(iters);
+  std::cout << "Profile done! Average latency is " << latency << " ms.\n";
+  std::cout << "TFLOPS: "
+            << ((double)M * (double)N * (double)K * 2.0) / (latency / 1000.0) /
+                   1e12
+            << "\n";
 
   free_cpu_tensor(hA);
   free_cpu_tensor(hB);
