@@ -1403,7 +1403,7 @@ struct GemmKernelParams {
 
 template <class AType, class BType, class CType, class AccumType, int BlockM,
           int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
-__global__ void gpu_gemm_kernel(
+__global__ __launch_bounds__(384) void gpu_gemm_kernel(
     // GemmParams<AType, BType, CType, AccumType> gemm_params,
     GemmKernelParams<AType, BType, CType, AccumType, BlockM, BlockN, BlockK,
                      ClusterM, ClusterN, Stages>
@@ -1444,14 +1444,14 @@ __global__ void gpu_gemm_kernel(
   int lane_predicate = elect_one_sync();
 
   // only the first thread in a block launch tma prefetch
-  if ((warp_idx == 0) && lane_predicate) {
-    Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
-             ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
-                                                        &tensormap_b);
-    Epilogue<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
-             ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
-                                                        &tensormap_b);
-  }
+  // if ((warp_idx == 0) && lane_predicate) {
+  //   Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+  //            ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
+  //                                                       &tensormap_b);
+  //   Epilogue<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+  //            ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
+  //                                                       &tensormap_b);
+  // }
 
   // PRINT_BT(0, 0, 0, "TMA prefetch issued\n");
 
