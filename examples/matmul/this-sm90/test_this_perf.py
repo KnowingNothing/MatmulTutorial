@@ -5,24 +5,24 @@ import os
 
 example_text = """
  example:
-    python test_cublas_perf.py --begin 0 --num 1
+    python test_this_perf.py --begin 0 --num 1 --version 1
 """
 
 
-def build(sm):
-    for file in ["call_cublas.cu"]:
+def build(version: int):
+    for file in [f"matmul-pingpong-v{version}.cu"]:
         assert os.path.exists(file) and os.path.isfile(
             file), "CUDA files not exist"
-    command = f"nvcc -arch=sm_{sm} -lcublas call_cublas.cu -o test_cublas"
+    command = f"nvcc -arch=sm_90a -I ../../../include -lcuda -std=c++17 matmul-pingpong-v{version}.cu -o test_v{version}"
 
     p = subprocess.run(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    assert p.returncode == 0
+    assert p.returncode == 0, str(p)
 
 
-def main(M, N, K):
-    command = f"./test_cublas M {M} N {N} K {K}"
+def main(M, N, K, version):
+    command = f"./test_v{version} M {M} N {N} K {K}"
     p = subprocess.run(command, shell=True, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, text=True)
 
@@ -31,9 +31,8 @@ def main(M, N, K):
         print(p.stdout)
         for line in p.stdout.splitlines():
             print(line)
-            key = "Running cost (ms) of CuBLAS is"
+            key = "Profile done! Average latency (ms) is"
             if key in line:
-                print("YES")
                 cost = float(line[len(key)+1:])
         return cost
     else:
@@ -58,7 +57,7 @@ if __name__ == "__main__":
         epilog=example_text,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--only_once", action="store_true")
+    # parser.add_argument("--only_once", action="store_true")
     # parser.add_argument(
     #     "--in_dtype",
     #     type=str,
@@ -78,19 +77,19 @@ if __name__ == "__main__":
         "--num", type=int, choices=list(range(1, len(shapes) + 1)), default=len(shapes)
     )
     parser.add_argument(
-        "--sm", type=str, default="80"
+      "--version", type=int, default=1
     )
 
     args = parser.parse_args()
     costs = []
-    build(args.sm)
+    build(args.version)
     for i in tqdm(range(args.begin, args.begin + args.num)):
         M, N, K = shapes[i]
-        cost = main(M, N, K)
+        cost = main(M, N, K, args.version)
         costs.append((shapes[i], cost))
 
-    with open("cublas_results.csv", "w") as fout:
-        print("CUBLAS Performance", file=fout)
+    with open("this_results.csv", "w") as fout:
+        print("This Performance", file=fout)
         print("M,N,K,in_dtype,acc_dtype,cost(ms),TFLOPS", file=fout)
         for cc in costs:
             M, N, K = cc[0]
