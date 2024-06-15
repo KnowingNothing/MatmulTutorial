@@ -24,7 +24,7 @@ There is a detailed [explanation](https://zhuanlan.zhihu.com/p/631227862) about 
 
 # Performance Results
 
-## Performance on H100 GPU
+## Performance on H800 GPU
 ![image](static/this-sm90.png)
 The current version only achieves on average 70% performance of CuBLAS. I am still working on improving the performance.
 
