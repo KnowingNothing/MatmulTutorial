@@ -31,7 +31,7 @@ The current version only achieves on average 70% performance of CuBLAS. I am sti
 
 ## Performance on A100 GPU
 <!-- ![image](static/a100-perf.png) -->
-<img src=static/this.png alt="A100-GEMM-perf" width="2000" height="700">
+<img src=static/this.png alt="A100-GEMM-perf" width="2000" height="600">
 The overall performance comparison among Relay, CuBLAS, CUTLASS, TensorIR, Triton, and our implementations. The y-axis is speedup to Relay+CUTLASS.
 
 **Overall, the geometric mean speedup to Relay+CUTLASS is 1.73x, to TensorIR (1000 tuning trials using MetaSchedule per case) is 1.22x, to CuBLAS is 1.00x, to CUTLASS is 0.999x, to Triton is 1.07x.**
