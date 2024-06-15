@@ -1,10 +1,10 @@
 #include "common.h"
 #include "reference.h"
 
-const int testM = 5120;
+const int testM = 4096;
 const int testN = 4096;
-const int testK = 2048;
-const int iters = 100;
+const int testK = 4096;
+const int iters = 200;
 static constexpr int CLUSTER_M = 2;
 static constexpr int CLUSTER_N = 1;
 static constexpr int WG_NUMBER = 3;
@@ -1349,20 +1349,21 @@ struct Epilogue {
       [[maybe_unused]] const utils::TmaDescriptor* tensormap_b) {}
 
   template <typename WGMMA>
-  DEVICE void store(CType* dst, WGMMA wgmma, AccumType* accum, int m_idx,
-                    int n_idx, int M, int N) {
+  DEVICE void store(CType* dst, WGMMA wgmma,
+                    const AccumType accum[WGMMA::num_elements_accumulators],
+                    int m_idx, int n_idx, int M, int N) {
     // this store is specialized for WgMMA M64NnK16
     int m = m_idx * BlockM;
     int n = n_idx * BlockN;
 
+#pragma unroll
     for (int i = 0; i < WGMMA::num_elements_accumulators; ++i) {
-      AccumType value = accum[i];
       int m_frag, n_frag, k_wgmma, row_id, col_id, item_id;
       WGMMA::get_4d_idx_from_linear(k_wgmma, row_id, col_id, item_id, i);
       WGMMA::get_m_n_idx_fragment(m_frag, n_frag, threadIdx.x % WARP_GROUP_SIZE,
                                   k_wgmma, row_id, col_id, item_id);
       if ((m + m_frag < M) && (n + n_frag < N)) {
-        dst[(m + m_frag) * N + (n + n_frag)] = (CType)value;
+        dst[(m + m_frag) * N + (n + n_frag)] = (CType)accum[i];
       }
     }
   }
@@ -1402,7 +1403,7 @@ struct GemmKernelParams {
 
 template <class AType, class BType, class CType, class AccumType, int BlockM,
           int BlockN, int BlockK, int ClusterM, int ClusterN, int Stages>
-__global__ void gpu_gemm_kernel(
+__global__ __launch_bounds__(384) void gpu_gemm_kernel(
     // GemmParams<AType, BType, CType, AccumType> gemm_params,
     GemmKernelParams<AType, BType, CType, AccumType, BlockM, BlockN, BlockK,
                      ClusterM, ClusterN, Stages>
@@ -1443,14 +1444,14 @@ __global__ void gpu_gemm_kernel(
   int lane_predicate = elect_one_sync();
 
   // only the first thread in a block launch tma prefetch
-  if ((warp_idx == 0) && lane_predicate) {
-    Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
-             ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
-                                                        &tensormap_b);
-    Epilogue<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
-             ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
-                                                        &tensormap_b);
-  }
+  // if ((warp_idx == 0) && lane_predicate) {
+  //   Mainloop<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+  //            ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
+  //                                                       &tensormap_b);
+  //   Epilogue<AType, BType, CType, AccumType, BlockM, BlockN, BlockK, ClusterM,
+  //            ClusterN, Stages>::prefetch_tma_descriptor(&tensormap_a,
+  //                                                       &tensormap_b);
+  // }
 
   // PRINT_BT(0, 0, 0, "TMA prefetch issued\n");
 
@@ -1682,6 +1683,24 @@ int main(int argc, char** argv) {
   int M = testM;
   int N = testN;
   int K = testK;
+  if (argc > 1) {
+    assert((argc - 1) % 2 == 0);
+    for (int i = 1; i < argc; i += 2) {
+      char* key = argv[i];
+      char* value = argv[i + 1];
+      std::string keys(key);
+      if (keys == "M") {
+        M = std::atoi(value);
+      }
+      else if (keys == "N") {
+        N = std::atoi(value);
+      }
+      else if (keys == "K") {
+        K = std::atoi(value);
+      }
+    }
+  }
+  std::cout << "Testing shape M=" << M << ", N=" << N << ", K=" << K << "\n";
   using AType = half_t;
   using BType = half_t;
   using CType = half_t;
@@ -1764,7 +1783,7 @@ int main(int argc, char** argv) {
   gpu_timer.tick();
   gpu_timer.sync_all();
   float latency = gpu_timer.report_last_ms() / float(iters);
-  std::cout << "Profile done! Average latency is " << latency << " ms.\n";
+  std::cout << "Profile done! Average latency (ms) is " << latency << "\n";
   std::cout << "TFLOPS: "
             << ((double)M * (double)N * (double)K * 2.0) / (latency / 1000.0) /
                    1e12

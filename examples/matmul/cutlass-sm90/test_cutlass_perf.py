@@ -5,15 +5,15 @@ import os
 
 example_text = """
  example:
-    python test_cublas_perf.py --begin 0 --num 1
+    python test_cutlass_perf.py --begin 0 --num 1
 """
 
 
-def build(sm):
-    for file in ["call_cublas.cu"]:
+def build():
+    for file in ["pingpong-gemm.cu"]:
         assert os.path.exists(file) and os.path.isfile(
             file), "CUDA files not exist"
-    command = f"nvcc -arch=sm_{sm} -lcublas call_cublas.cu -o test_cublas"
+    command = "nvcc -arch=sm_90a -std=c++17 --expt-relaxed-constexpr -I ../../../3rdparty/cutlass/include/ -I ../../../3rdparty/cutlass/examples/common/ -I ../../../3rdparty/cutlass/tools/util/include/ pingpong-gemm.cu -lcuda -lcudart -o test_cutlass"
 
     p = subprocess.run(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -22,7 +22,7 @@ def build(sm):
 
 
 def main(M, N, K):
-    command = f"./test_cublas M {M} N {N} K {K}"
+    command = f"./test_cutlass --m={M} --n={N} --k={K} --iterations=200"
     p = subprocess.run(command, shell=True, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, text=True)
 
@@ -31,10 +31,10 @@ def main(M, N, K):
         print(p.stdout)
         for line in p.stdout.splitlines():
             print(line)
-            key = "Running cost (ms) of CuBLAS is"
+            key = "  Avg runtime:"
             if key in line:
                 print("YES")
-                cost = float(line[len(key)+1:])
+                cost = float(line[len(key)+1:][:-3])
         return cost
     else:
         print("Error!")
@@ -58,7 +58,7 @@ if __name__ == "__main__":
         epilog=example_text,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--only_once", action="store_true")
+    # parser.add_argument("--only_once", action="store_true")
     # parser.add_argument(
     #     "--in_dtype",
     #     type=str,
@@ -77,20 +77,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num", type=int, choices=list(range(1, len(shapes) + 1)), default=len(shapes)
     )
-    parser.add_argument(
-        "--sm", type=str, default="80"
-    )
 
     args = parser.parse_args()
     costs = []
-    build(args.sm)
+    build()
     for i in tqdm(range(args.begin, args.begin + args.num)):
         M, N, K = shapes[i]
         cost = main(M, N, K)
         costs.append((shapes[i], cost))
 
-    with open("cublas_results.csv", "w") as fout:
-        print("CUBLAS Performance", file=fout)
+    with open("cutlass_results.csv", "w") as fout:
+        print("CUTLASS Performance", file=fout)
         print("M,N,K,in_dtype,acc_dtype,cost(ms),TFLOPS", file=fout)
         for cc in costs:
             M, N, K = cc[0]
