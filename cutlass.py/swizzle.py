@@ -55,8 +55,8 @@ def test_swizzle():
 
     # Swizzle<3, 4, 4>
     print("Swizzle<3,4,3>")
-    rows = 128
-    cols = 64
+    rows = 8
+    cols = 128
     mtx = get_ind_matrix(rows, cols)
     print_matrix(mtx, rows, cols, prompt="Original")
     print()
@@ -93,4 +93,4 @@ def test_swizzle():
 
 
 if __name__ == "__main__":
-    pass
+    test_swizzle()
