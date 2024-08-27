@@ -41,8 +41,8 @@ def main(M, N, K):
         return cost
 
 
-dims = [128 * i for i in range(1, 11)]
-base_shape = [5376, 5376, 2048]
+dims = [512 * i for i in range(1, 11)]
+base_shape = [8192, 8192, 8192]
 shapes = [base_shape]
 for dim in range(3):
     for f in [-1, 1]:

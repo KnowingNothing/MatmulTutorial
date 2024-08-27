@@ -22,7 +22,7 @@ def build():
 
 
 def main(M, N, K):
-    command = f"./test_cutlass M {M} N {N} K {K}"
+    command = f"./test_cutlass --m={M} --n={N} --k={K} --iterations=200"
     p = subprocess.run(command, shell=True, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, text=True)
 
