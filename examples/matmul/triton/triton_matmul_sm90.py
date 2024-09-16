@@ -232,12 +232,12 @@ def main(M, N, K, trials):
 
     # Record the start event
     start_event.record()
-    for i in range(200):
+    for i in range(trials):
         triton_output = matmul_tma_persistent(desc_a, desc_b, desc_c, dtype, NUM_SMS)
     end_event.record()
     end_event.synchronize()
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    return elapsed_time_ms / 200
+    return elapsed_time_ms / trials
 
 
 dims = [512 * i for i in range(1, 11)]
