@@ -147,7 +147,7 @@ def main(M_list, N, K, trials):
     offset_pad = 0
     for i, (org, pad) in enumerate(zip(M_list, M_list_pad)):
         scatter_idx[offset_pad: offset_pad + org] = (torch.arange(org, dtype=torch.int32, device="cuda") + offset)
-        scatter_idx[offset_pad + org: offset_pad + pad] = 0
+        scatter_idx[offset_pad + org: offset_pad + pad] = EM
         expert_idx_full[offset_pad: offset_pad + pad] = i
         offset += org
         offset_pad += pad
