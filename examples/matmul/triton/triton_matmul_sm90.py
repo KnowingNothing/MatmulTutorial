@@ -191,6 +191,7 @@ def main(M, N, K, trials):
     torch.manual_seed(0)
     a = torch.randn((M, K), device="cuda", dtype=torch.float16)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+    b = b.T.contiguous()
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     # Check constraints.
     assert a.dtype == b.dtype, "Incompatible dtypes"
