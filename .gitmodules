@@ -1,3 +1,0 @@
-[submodule "3rdparty/triton"]
-	path = 3rdparty/triton
-	url = git@github.com:openai/triton.git
