@@ -7,3 +7,4 @@ test_cublas
 playground
 ablation_test
 *.pyc
+*.sqsh
