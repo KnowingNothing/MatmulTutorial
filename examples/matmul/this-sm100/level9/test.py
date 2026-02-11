@@ -124,3 +124,4 @@ if __name__ == "__main__":
     for sz in [4096, 6144, 8192, 10240, 12288]:
         benchmark(M=sz, N=sz, K=sz)
         print()
+    benchmark(M=5120, N=8192, K=6144)
